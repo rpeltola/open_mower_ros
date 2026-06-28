@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "coverage_feedback/GetFillPaths.h"
 #include "mower_logic/CheckPoint.h"
 #include "mower_map/ClearNavPointSrv.h"
 #include "mower_map/GetMowingAreaSrv.h"
@@ -92,6 +93,7 @@ extern ros::ServiceClient pathClient;
 extern ros::ServiceClient pathProgressClient;
 extern ros::ServiceClient setNavPointClient;
 extern ros::ServiceClient clearNavPointClient;
+extern ros::ServiceClient coverageFeedbackClient;
 
 extern actionlib::SimpleActionClient<mbf_msgs::MoveBaseAction>* mbfClient;
 extern actionlib::SimpleActionClient<mbf_msgs::ExePathAction>* mbfClientExePath;
@@ -137,12 +139,21 @@ Behavior* MowingBehavior::execute() {
     ROS_INFO_STREAM("MowingBehavior: Executing mowing plan");
     bool finished = execute_mowing_plan();
     if (finished) {
+      // Coverage feedback: before leaving this area, check the ground we actually cut against the
+      // area polygon and, if patches were missed, run fill passes instead of docking. Bounded by a
+      // per-area round cap so untraversable spots can't loop forever.
+      if (request_coverage_refill()) {
+        // Fill paths were queued into currentMowingPaths; re-run the plan on them (do not advance
+        // the area or dock yet).
+        continue;
+      }
       // skip to next area if current
       ROS_INFO_STREAM("MowingBehavior: Executing mowing plan - finished");
       currentMowingArea++;
       currentMowingPaths.clear();
       currentMowingPath = 0;
       currentMowingPathIndex = 0;
+      refill_round = 0;
     }
   }
 
@@ -154,10 +165,57 @@ Behavior* MowingBehavior::execute() {
   return &DockingBehavior::INSTANCE;
 }
 
+bool MowingBehavior::request_coverage_refill() {
+  if (!getConfig().coverage_feedback_enabled) {
+    return false;
+  }
+  // execute_mowing_plan() also returns true when the area was skipped (skip_area clears the paths);
+  // a real completion leaves currentMowingPaths populated. Never re-mow a deliberately skipped area.
+  if (currentMowingPaths.empty()) {
+    return false;
+  }
+  if (refill_round >= getConfig().max_refill_rounds) {
+    ROS_INFO_STREAM("MowingBehavior: coverage refill round cap (" << getConfig().max_refill_rounds
+                                                                  << ") reached - docking.");
+    return false;
+  }
+  if (currentMowingAreaData.area.points.size() < 3) {
+    return false;
+  }
+
+  coverage_feedback::GetFillPaths srv;
+  srv.request.area = currentMowingAreaData;
+  srv.request.tool_width = getConfig().tool_width;
+  if (!coverageFeedbackClient.call(srv)) {
+    ROS_WARN_STREAM("MowingBehavior: coverage_feedback service unavailable - proceeding to dock.");
+    return false;
+  }
+  if (srv.response.paths.empty()) {
+    ROS_INFO_STREAM("MowingBehavior: coverage sufficient (" << srv.response.uncovered_area
+                                                            << " m^2 uncovered) - no refill needed.");
+    return false;
+  }
+
+  refill_round++;
+  ROS_INFO_STREAM("MowingBehavior: coverage refill round " << refill_round << "/" << getConfig().max_refill_rounds
+                                                           << " - " << srv.response.gap_count << " gap(s), "
+                                                           << srv.response.uncovered_area << " m^2 to re-mow.");
+  currentMowingPaths = srv.response.paths;
+  currentMowingPath = 0;
+  currentMowingPathIndex = 0;
+  // Invalidate the checkpoint digest: while fill paths run, the saved path/index refer to the fill
+  // plan, not the original area plan. If we crash mid-refill and restart, create_mowing_plan()
+  // rebuilds the original area plan whose digest then won't match, so it restarts the area from the
+  // beginning (re-mowing it) rather than resuming at a misaligned index.
+  currentMowingPlanDigest = "";
+  return true;
+}
+
 void MowingBehavior::enter() {
   skip_area = false;
   skip_path = false;
   paused = aborted = false;
+  refill_round = 0;
 
   for (auto& a : actions) {
     a.enabled = true;
@@ -176,6 +234,7 @@ void MowingBehavior::reset() {
   publishMowerEvent("JOB_COMPLETE");
   current_job_finished = true;
   currentMowingPaths.clear();
+  refill_round = 0;
   currentMowingArea = 0;
   currentMowingPath = 0;
   currentMowingPathIndex = 0;
@@ -224,6 +283,8 @@ bool MowingBehavior::create_mowing_plan(int area_index) {
 
   currentMowingAreaId = mapSrv.response.area.id;
   currentMowingAreaName = mapSrv.response.area.name;
+  // Cache the full area (polygon + obstacles) for the coverage-feedback check at area finish.
+  currentMowingAreaData = mapSrv.response.area;
 
   if (!mapSrv.response.area.active) {
     ROS_INFO_STREAM("MowingBehavior: Skipping inactive mowing area");

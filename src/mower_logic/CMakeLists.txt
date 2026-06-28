@@ -8,6 +8,7 @@ project(mower_logic)
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
+        coverage_feedback
         dynamic_reconfigure
         ftc_local_planner
         mbf_msgs

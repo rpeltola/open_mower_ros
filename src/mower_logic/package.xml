@@ -9,6 +9,7 @@
   <url type="website">https://github.com/ClemensElflein/OpenMower</url>
 
   <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>coverage_feedback</build_depend>
   <build_depend>dynamic_reconfigure</build_depend>
   <build_depend>ftc_local_planner</build_depend>
   <build_depend>mbf_msgs</build_depend>
@@ -27,6 +28,7 @@
   <depend>xbot_mqtt</depend>
   <build_depend>crypto++</build_depend>
   <depend>xbot_positioning</depend>
+  <build_export_depend>coverage_feedback</build_export_depend>
   <build_export_depend>dynamic_reconfigure</build_export_depend>
   <build_export_depend>ftc_local_planner</build_export_depend>
   <build_export_depend>mbf_msgs</build_export_depend>
@@ -39,6 +41,7 @@
   <build_export_depend>tf2_geometry_msgs</build_export_depend>
   <build_export_depend>tf2_ros</build_export_depend>
   <build_export_depend>xbot_msgs</build_export_depend>
+  <exec_depend>coverage_feedback</exec_depend>
   <exec_depend>dynamic_reconfigure</exec_depend>
   <exec_depend>ftc_local_planner</exec_depend>
   <exec_depend>mbf_msgs</exec_depend>

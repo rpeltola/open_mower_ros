@@ -13,11 +13,18 @@ find_package(catkin REQUIRED COMPONENTS
         std_msgs
         geometry_msgs
         nav_msgs
+        visualization_msgs
         message_generation
         mower_map
         mower_msgs
         slic3r_coverage_planner
         xbot_msgs
+)
+
+## Generate messages in the 'msg' folder
+add_message_files(
+        FILES
+        CoverageStatus.msg
 )
 
 ## Generate services in the 'srv' folder
@@ -42,6 +49,7 @@ catkin_package(
         std_msgs
         geometry_msgs
         nav_msgs
+        visualization_msgs
         message_runtime
         mower_map
         mower_msgs

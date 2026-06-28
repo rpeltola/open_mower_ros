@@ -57,6 +57,15 @@ std::string MowingBehavior::state_name() {
   return "MOWING";
 }
 
+std::string MowingBehavior::sub_state_name() {
+  // Mark the time window during which coverage-feedback fill paths are being executed, so it is
+  // visible in /mower_logic/current_state (and any recorded bag) which mowing was a re-mow.
+  if (refill_round > 0) {
+    return "REFILL " + std::to_string(refill_round) + "/" + std::to_string(getConfig().max_refill_rounds);
+  }
+  return "";
+}
+
 Behavior* MowingBehavior::execute() {
   shared_state->active_semiautomatic_task = true;
 
@@ -135,6 +144,9 @@ bool MowingBehavior::request_coverage_refill() {
   if (srv.response.paths.empty()) {
     ROS_INFO_STREAM("MowingBehavior: coverage sufficient (" << srv.response.uncovered_area
                                                             << " m^2 uncovered) - no refill needed.");
+    publishMowerEvent("COVERAGE_OK", json{{"area_id", currentMowingAreaData.id},
+                                          {"area_name", currentMowingAreaData.name},
+                                          {"uncovered_m2", srv.response.uncovered_area}});
     return false;
   }
 
@@ -142,6 +154,12 @@ bool MowingBehavior::request_coverage_refill() {
   ROS_INFO_STREAM("MowingBehavior: coverage refill round " << refill_round << "/" << getConfig().max_refill_rounds
                                                            << " - " << srv.response.gap_count << " gap(s), "
                                                            << srv.response.uncovered_area << " m^2 to re-mow.");
+  publishMowerEvent("COVERAGE_REFILL", json{{"area_id", currentMowingAreaData.id},
+                                            {"area_name", currentMowingAreaData.name},
+                                            {"round", refill_round},
+                                            {"max_rounds", getConfig().max_refill_rounds},
+                                            {"gaps", srv.response.gap_count},
+                                            {"uncovered_m2", srv.response.uncovered_area}});
   currentMowingPaths = srv.response.paths;
   currentMowingPath = 0;
   currentMowingPathIndex = 0;

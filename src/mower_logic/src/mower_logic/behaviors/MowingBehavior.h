@@ -65,6 +65,8 @@ class MowingBehavior : public Behavior {
 
   std::string state_name() override;
 
+  std::string sub_state_name() override;
+
   Behavior* execute() override;
 
   void enter() override;

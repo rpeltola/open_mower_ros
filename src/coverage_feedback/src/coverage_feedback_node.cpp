@@ -83,9 +83,9 @@ class CoverageFeedback {
       grid_timer_ = nh.createTimer(ros::Duration(1.0), &CoverageFeedback::publishGrid, this);
     }
 
-    ROS_INFO_STREAM("coverage_feedback: res=" << res_ << "m tool_width=" << tool_width_
-                                              << "m min_gap_width=" << min_gap_width_ << "m min_gap_area="
-                                              << min_gap_area_ << "m^2 erosion_margin=" << erosion_margin_ << "m");
+    ROS_INFO_STREAM("coverage_feedback: res=" << res_ << "m tool_width=" << tool_width_ << "m min_gap_width="
+                                              << min_gap_width_ << "m min_gap_area=" << min_gap_area_
+                                              << "m^2 erosion_margin=" << erosion_margin_ << "m");
   }
 
  private:
@@ -341,7 +341,7 @@ class CoverageFeedback {
       plan.request.outer_offset = 0.0;
       plan.request.outline_count = 0;
       plan.request.outline_overlap_count = 0;
-      plan.request.skip_area_outline = true;      // fill only, no perimeter pass around the gap
+      plan.request.skip_area_outline = true;  // fill only, no perimeter pass around the gap
       plan.request.skip_obstacle_outlines = true;
       plan.request.skip_fill = false;
       plan.request.outline = poly;

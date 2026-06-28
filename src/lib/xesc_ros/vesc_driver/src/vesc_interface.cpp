@@ -35,6 +35,11 @@
 
 #include "vesc_driver/vesc_interface.h"
 
+#include <ros/ros.h>
+
+#include <iomanip>
+#include <sstream>
+
 namespace vesc_driver {
 
     VescInterface::VescInterface(const ErrorHandlerFunction &error_handler, uint32_t state_request_millis)
@@ -213,6 +218,31 @@ namespace vesc_driver {
             status_.tacho = values->getPosition();
             status_.tacho_absolute = values->getDisplacement();
             status_.direction = values->getVelocityERPM() < 0;
+
+            // --- DEBUG ESC telemetry (test branch) ------------------------------------------------
+            // Dump the raw COMM_GET_VALUES payload plus every parsed field, to diagnose why
+            // speed_erpm/rpm reads 0 while tacho moves. Throttled per-instance to ~every 50th Values
+            // packet. The hex tokens are 0-based at the payload start, so data_map offsets line up:
+            // ERPM=23 is hex token 23 (4 bytes), TACHOMETER_ABS=49 is token 49 (4 bytes), etc.
+            if (status_.seq % 50 == 0) {
+                const Buffer& frame = packet->getFrame();
+                std::ostringstream hex;
+                // Payload begins at frame[2] (after SOF + length byte); CRC+EOF are the last 3 bytes.
+                for (size_t i = 2; i + 3 < frame.size(); ++i)
+                    hex << std::setw(2) << std::setfill('0') << std::hex << static_cast<int>(frame[i]) << ' ';
+                ROS_INFO("[vesc %s] seq=%u fw=%d.%d conn=%d | erpm=%.1f duty=%.3f I_mot=%.2f I_in=%.2f "
+                         "V=%.1f temp_pcb=%.1f temp_mot=%.1f | tacho=%d tacho_abs=%d dir=%d fault=%d | "
+                         "payload[%zu]: %s",
+                         port_.c_str(), status_.seq, status_.fw_version_major, status_.fw_version_minor,
+                         static_cast<int>(status_.connection_state), values->getVelocityERPM(),
+                         values->getDuty(), values->getMotorCurrent(), values->getInputCurrent(),
+                         values->getInputVoltage(), values->getMosTemp(), values->getMotorTemp(),
+                         static_cast<int>(values->getPosition()), static_cast<int>(values->getDisplacement()),
+                         static_cast<int>(values->getVelocityERPM() < 0), values->getFaultCode(),
+                         frame.size(), hex.str().c_str());
+            }
+            // --------------------------------------------------------------------------------------
+
             status_cv_.notify_all();
         } else if (packet->getName() == "FWVersion") {
             std::lock_guard<std::mutex> lk(status_mutex_);

@@ -28,22 +28,28 @@
 //      requests a linear fill from slic3r along the gap's major axis (PCA). The aggregated fill paths
 //      are returned so MowingBehavior can run them before docking.
 
+#include <geometry_msgs/Point.h>
 #include <geometry_msgs/Point32.h>
 #include <geometry_msgs/Polygon.h>
 #include <mower_msgs/HighLevelStatus.h>
 #include <mower_msgs/Status.h>
 #include <nav_msgs/OccupancyGrid.h>
+#include <nav_msgs/Path.h>
 #include <ros/ros.h>
 #include <slic3r_coverage_planner/PlanPath.h>
+#include <std_msgs/Header.h>
+#include <visualization_msgs/MarkerArray.h>
 #include <xbot_msgs/AbsolutePose.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <vector>
 
+#include "coverage_feedback/CoverageStatus.h"
 #include "coverage_feedback/GetFillPaths.h"
 
 namespace {
@@ -82,6 +88,11 @@ class CoverageFeedback {
       grid_pub_ = private_nh.advertise<nav_msgs::OccupancyGrid>("coverage_grid", 1, true);
       grid_timer_ = nh.createTimer(ros::Duration(1.0), &CoverageFeedback::publishGrid, this);
     }
+
+    // Telemetry (latched so `rosbag record -a` always captures the latest state).
+    status_pub_ = private_nh.advertise<coverage_feedback::CoverageStatus>("status", 1, true);
+    gaps_pub_ = private_nh.advertise<visualization_msgs::MarkerArray>("gaps", 1, true);
+    fill_paths_pub_ = private_nh.advertise<nav_msgs::Path>("fill_paths", 1, true);
 
     ROS_INFO_STREAM("coverage_feedback: res=" << res_ << "m tool_width=" << tool_width_ << "m min_gap_width="
                                               << min_gap_width_ << "m min_gap_area=" << min_gap_area_
@@ -206,6 +217,124 @@ class CoverageFeedback {
   }
 
   // -------------------------------------------------------------------------
+  // Telemetry (gap visualization + fill paths), captured by `rosbag record -a`
+  // -------------------------------------------------------------------------
+  struct GapViz {
+    geometry_msgs::Polygon polygon;  // gap outline (dilated), map frame
+    double angle = 0.0;              // PCA major axis / fill direction (rad)
+    double area_m2 = 0.0;            // detected gap area
+    double cx = 0.0;                 // centroid (map frame)
+    double cy = 0.0;
+  };
+
+  // Drop any previously published gap markers and fill path (gaps were closed or none found).
+  void clearGaps(const std_msgs::Header& hdr) {
+    visualization_msgs::MarkerArray arr;
+    visualization_msgs::Marker del;
+    del.header = hdr;
+    del.action = visualization_msgs::Marker::DELETEALL;
+    arr.markers.push_back(del);
+    gaps_pub_.publish(arr);
+    nav_msgs::Path empty;
+    empty.header = hdr;
+    fill_paths_pub_.publish(empty);
+  }
+
+  // Publish, per detected gap: a red outline, a cyan fill-direction arrow, and an area label.
+  void publishGaps(const std::vector<GapViz>& gaps, const std_msgs::Header& hdr) {
+    visualization_msgs::MarkerArray arr;
+    visualization_msgs::Marker del;
+    del.header = hdr;
+    del.action = visualization_msgs::Marker::DELETEALL;
+    arr.markers.push_back(del);
+
+    int id = 0;
+    for (const auto& g : gaps) {
+      visualization_msgs::Marker outline;
+      outline.header = hdr;
+      outline.ns = "gap_outline";
+      outline.id = id;
+      outline.type = visualization_msgs::Marker::LINE_STRIP;
+      outline.action = visualization_msgs::Marker::ADD;
+      outline.scale.x = 0.03;
+      outline.color.r = 1.0;
+      outline.color.a = 1.0;
+      outline.pose.orientation.w = 1.0;
+      for (const auto& p : g.polygon.points) {
+        geometry_msgs::Point pt;
+        pt.x = p.x;
+        pt.y = p.y;
+        pt.z = 0.05;
+        outline.points.push_back(pt);
+      }
+      if (!g.polygon.points.empty()) {
+        geometry_msgs::Point pt;
+        pt.x = g.polygon.points.front().x;
+        pt.y = g.polygon.points.front().y;
+        pt.z = 0.05;
+        outline.points.push_back(pt);  // close the loop
+      }
+      arr.markers.push_back(outline);
+
+      visualization_msgs::Marker arrow;
+      arrow.header = hdr;
+      arrow.ns = "gap_direction";
+      arrow.id = id;
+      arrow.type = visualization_msgs::Marker::ARROW;
+      arrow.action = visualization_msgs::Marker::ADD;
+      arrow.scale.x = 0.03;
+      arrow.scale.y = 0.07;
+      arrow.color.g = 1.0;
+      arrow.color.b = 1.0;
+      arrow.color.a = 1.0;
+      arrow.pose.orientation.w = 1.0;
+      const double half = 0.25;
+      geometry_msgs::Point a;
+      geometry_msgs::Point b;
+      a.x = g.cx - half * std::cos(g.angle);
+      a.y = g.cy - half * std::sin(g.angle);
+      a.z = 0.05;
+      b.x = g.cx + half * std::cos(g.angle);
+      b.y = g.cy + half * std::sin(g.angle);
+      b.z = 0.05;
+      arrow.points.push_back(a);
+      arrow.points.push_back(b);
+      arr.markers.push_back(arrow);
+
+      visualization_msgs::Marker text;
+      text.header = hdr;
+      text.ns = "gap_label";
+      text.id = id;
+      text.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+      text.action = visualization_msgs::Marker::ADD;
+      text.pose.position.x = g.cx;
+      text.pose.position.y = g.cy;
+      text.pose.position.z = 0.2;
+      text.pose.orientation.w = 1.0;
+      text.scale.z = 0.12;
+      text.color.r = text.color.g = text.color.b = 1.0;
+      text.color.a = 1.0;
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%.2f m^2", g.area_m2);
+      text.text = buf;
+      arr.markers.push_back(text);
+
+      id++;
+    }
+    gaps_pub_.publish(arr);
+  }
+
+  // Publish the queued re-mow geometry as a single Path so the re-mowed strips are visible.
+  void publishFillPaths(const std::vector<slic3r_coverage_planner::Path>& paths, const std_msgs::Header& hdr) {
+    nav_msgs::Path path;
+    path.header = hdr;
+    for (const auto& p : paths) {
+      for (const auto& ps : p.path.poses) path.poses.push_back(ps);
+    }
+    fill_paths_pub_.publish(path);
+  }
+
+  // -------------------------------------------------------------------------
   // Gap detect + refill
   // -------------------------------------------------------------------------
   bool onGetFillPaths(coverage_feedback::GetFillPaths::Request& req, coverage_feedback::GetFillPaths::Response& res) {
@@ -213,14 +342,30 @@ class CoverageFeedback {
     res.uncovered_area = 0.0;
     res.gap_count = 0;
 
+    std_msgs::Header hdr;
+    hdr.stamp = ros::Time::now();
+    hdr.frame_id = map_frame_;
+    coverage_feedback::CoverageStatus status;
+    status.header = hdr;
+    status.area_id = req.area.id;
+    status.area_name = req.area.name;
+    auto emitStatus = [&](bool refill) {
+      status.refill_requested = refill;
+      status_pub_.publish(status);
+    };
+
     const double tool_width = req.tool_width > 0.0 ? req.tool_width : tool_width_;
 
     if (!initialized_) {
       ROS_WARN_STREAM("coverage_feedback: no coverage accumulated yet - cannot assess gaps, skipping refill.");
+      clearGaps(hdr);
+      emitStatus(false);
       return true;
     }
     if (req.area.area.points.size() < 3) {
       ROS_WARN_STREAM("coverage_feedback: area polygon has < 3 points, skipping refill.");
+      clearGaps(hdr);
+      emitStatus(false);
       return true;
     }
 
@@ -247,6 +392,8 @@ class CoverageFeedback {
     const int rows = static_cast<int>(std::ceil((max_y - win_origin_y) / res_)) + 1;
     if (cols <= 0 || rows <= 0 || static_cast<long>(cols) * rows > 50'000'000L) {
       ROS_WARN_STREAM("coverage_feedback: unreasonable gap window " << cols << "x" << rows << ", skipping refill.");
+      clearGaps(hdr);
+      emitStatus(false);
       return true;
     }
 
@@ -274,6 +421,15 @@ class CoverageFeedback {
       grid_(inter).copyTo(covered(cv::Rect(inter.x - c0, inter.y - r0, inter.width, inter.height)));
     }
 
+    // Coverage stats over the eroded target (telemetry).
+    {
+      cv::Mat covered_in_target;
+      cv::bitwise_and(target, covered, covered_in_target);
+      status.target_area = cv::countNonZero(target) * (res_ * res_);
+      status.covered_area = cv::countNonZero(covered_in_target) * (res_ * res_);
+      status.coverage_percent = status.target_area > 0.0 ? 100.0 * status.covered_area / status.target_area : 100.0;
+    }
+
     // --- uncovered = target AND NOT covered ---
     cv::Mat uncovered;
     cv::bitwise_and(target, ~covered, uncovered);
@@ -296,15 +452,20 @@ class CoverageFeedback {
       total_uncovered += area_m2;
     }
     res.uncovered_area = total_uncovered;
+    status.gap_count = static_cast<int>(kept.size());
+    status.uncovered_area = total_uncovered;
 
     if (kept.empty() || total_uncovered < residual_stop_area_) {
       ROS_INFO_STREAM("coverage_feedback: " << kept.size() << " gap(s), " << total_uncovered
                                             << " m^2 uncovered < residual_stop_area (" << residual_stop_area_
                                             << ") - no refill.");
+      clearGaps(hdr);
+      emitStatus(false);
       return true;
     }
 
     // --- one slic3r linear fill per kept gap, aligned to the gap's major axis ---
+    std::vector<GapViz> gap_viz;
     const int dilate_px = std::max(1, static_cast<int>(std::round((tool_width / 2.0) / res_)));
     const cv::Mat dilate_kernel =
         cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * dilate_px + 1, 2 * dilate_px + 1));
@@ -334,6 +495,14 @@ class CoverageFeedback {
         poly.points.push_back(wp);
       }
 
+      GapViz gv;
+      gv.polygon = poly;
+      gv.angle = angle;
+      gv.area_m2 = stats.at<int>(label, cv::CC_STAT_AREA) * (res_ * res_);
+      gv.cx = win_origin_x + centroids.at<double>(label, 0) * res_;
+      gv.cy = win_origin_y + centroids.at<double>(label, 1) * res_;
+      gap_viz.push_back(gv);
+
       slic3r_coverage_planner::PlanPath plan;
       plan.request.fill_type = slic3r_coverage_planner::PlanPathRequest::FILL_LINEAR;
       plan.request.angle = angle;
@@ -354,6 +523,10 @@ class CoverageFeedback {
       res.paths.insert(res.paths.end(), plan.response.paths.begin(), plan.response.paths.end());
       res.gap_count++;
     }
+
+    publishGaps(gap_viz, hdr);
+    publishFillPaths(res.paths, hdr);
+    emitStatus(true);
 
     ROS_INFO_STREAM("coverage_feedback: refill plan ready - " << res.gap_count << " gap(s), " << total_uncovered
                                                               << " m^2 uncovered, " << res.paths.size()
@@ -396,6 +569,9 @@ class CoverageFeedback {
   ros::ServiceServer fill_service_;
   ros::ServiceClient plan_client_;
   ros::Publisher grid_pub_;
+  ros::Publisher status_pub_;
+  ros::Publisher gaps_pub_;
+  ros::Publisher fill_paths_pub_;
   ros::Timer grid_timer_;
 
   // --- params ---

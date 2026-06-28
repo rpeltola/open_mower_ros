@@ -71,6 +71,16 @@ bool allow_send = false;
 // Current speeds (duty cycle) for the three ESCs
 float speed_l = 0, speed_r = 0, speed_mow = 0, target_speed_mow = 0;
 
+// Opt-in closed-loop speed control (drive wheels only). Default is duty (open loop), which is
+// byte-for-byte the original behavior. When false, setSpeed() is never invoked.
+bool speed_control_mode = false;
+// Per-wheel ERPM targets, only used in speed_control_mode (mirrors speed_l/speed_r for duty mode).
+float erpm_l = 0, erpm_r = 0;
+// VESC FOC tachometer increments 6 counts per electrical revolution. wheel_ticks_per_m is
+// calibrated against this same tacho (odometry uses tacho_absolute), so:
+//   ERPM = v_wheel[m/s] * wheel_ticks_per_m * (60 / TICKS_PER_EREV)
+constexpr double TICKS_PER_EREV = 6.0;
+
 // Ticks / m and wheel distance for this robot
 double wheel_ticks_per_m = 0.0;
 double wheel_distance_m = 0.0;
@@ -114,23 +124,37 @@ bool is_emergency() {
   return emergency_high_level || emergency_low_level;
 }
 
+// Pure conversion: wheel linear speed [m/s] -> motor electrical RPM, using the odometry-calibrated
+// tick count. Free function so it is trivial to reason about and unit test.
+inline double wheelSpeedToErpm(double v_wheel_mps, double ticks_per_m) {
+  return v_wheel_mps * ticks_per_m * (60.0 / TICKS_PER_EREV);
+}
+
 void publishActuators() {
   speed_mow = target_speed_mow;
 
   // emergency or timeout -> send 0 speeds
+  // Safety zeroing is shared by both control modes: the duty targets (speed_*) keep their original
+  // behavior; the ERPM targets are zeroed alongside so speed mode stops on the same conditions.
   if (is_emergency()) {
     speed_l = 0;
     speed_r = 0;
     speed_mow = 0;
+    erpm_l = 0;
+    erpm_r = 0;
   }
   if (ros::Time::now() - last_cmd_vel > ros::Duration(1.0)) {
     speed_l = 0;
     speed_r = 0;
+    erpm_l = 0;
+    erpm_r = 0;
   }
   if (ros::Time::now() - last_cmd_vel > ros::Duration(25.0)) {
     speed_l = 0;
     speed_r = 0;
     speed_mow = 0;
+    erpm_l = 0;
+    erpm_r = 0;
   }
 
   if (mow_xesc_interface) {
@@ -138,8 +162,15 @@ void publishActuators() {
   }
   // We need to invert the speed, because the ESC has the same config as the left one, so the motor is running in the
   // "wrong" direction
-  left_xesc_interface->setDutyCycle(speed_l);
-  right_xesc_interface->setDutyCycle(-speed_r);
+  if (speed_control_mode) {
+    // NEW additive path: closed-loop ERPM. Same inversion convention as the duty path below.
+    left_xesc_interface->setSpeed(erpm_l);
+    right_xesc_interface->setSpeed(-erpm_r);
+  } else {
+    // EXISTING duty path — unchanged.
+    left_xesc_interface->setDutyCycle(speed_l);
+    right_xesc_interface->setDutyCycle(-speed_r);
+  }
 
   struct ll_heartbeat heartbeat = {.type = PACKET_ID_LL_HEARTBEAT,
                                    // If high level has emergency and LL does not know yet, we set it
@@ -469,20 +500,31 @@ void highLevelStatusReceived(const mower_msgs::HighLevelStatus::ConstPtr& msg) {
 }
 
 void velReceived(const geometry_msgs::Twist::ConstPtr& msg) {
-  // TODO: update this to rad/s values and implement xESC speed control
   last_cmd_vel = ros::Time::now();
-  speed_r = msg->linear.x + 0.5 * wheel_distance_m * msg->angular.z;
-  speed_l = msg->linear.x - 0.5 * wheel_distance_m * msg->angular.z;
 
-  if (speed_l >= 1.0) {
-    speed_l = 1.0;
-  } else if (speed_l <= -1.0) {
-    speed_l = -1.0;
-  }
-  if (speed_r >= 1.0) {
-    speed_r = 1.0;
-  } else if (speed_r <= -1.0) {
-    speed_r = -1.0;
+  if (speed_control_mode) {
+    // NEW additive path: cmd_vel carries true m/s. Split per wheel (diff drive) and convert to ERPM.
+    // No [-1, 1] clamp here: that clamp only makes sense for the duty fiction; the VESC speed PID and
+    // its configured max ERPM bound the command instead.
+    const double v_r = msg->linear.x + 0.5 * wheel_distance_m * msg->angular.z;
+    const double v_l = msg->linear.x - 0.5 * wheel_distance_m * msg->angular.z;
+    erpm_r = wheelSpeedToErpm(v_r, wheel_ticks_per_m);
+    erpm_l = wheelSpeedToErpm(v_l, wheel_ticks_per_m);
+  } else {
+    // EXISTING duty path — unchanged. cmd_vel.linear.x is treated directly as duty cycle.
+    speed_r = msg->linear.x + 0.5 * wheel_distance_m * msg->angular.z;
+    speed_l = msg->linear.x - 0.5 * wheel_distance_m * msg->angular.z;
+
+    if (speed_l >= 1.0) {
+      speed_l = 1.0;
+    } else if (speed_l <= -1.0) {
+      speed_l = -1.0;
+    }
+    if (speed_r >= 1.0) {
+      speed_r = 1.0;
+    } else if (speed_r <= -1.0) {
+      speed_r = -1.0;
+    }
   }
 }
 
@@ -733,6 +775,18 @@ int main(int argc, char** argv) {
 
   ROS_INFO_STREAM("Wheel ticks [1/m]: " << wheel_ticks_per_m);
   ROS_INFO_STREAM("Wheel distance [m]: " << wheel_distance_m);
+
+  // Opt-in drive control mode. Default "duty" => unchanged open-loop behavior; not present in any
+  // shipped config. Only "speed" enables the closed-loop ERPM path (VESC/xesc_mini backend only).
+  const std::string control_mode = paramNh.param<std::string>("control_mode", "duty");
+  speed_control_mode = (control_mode == "speed");
+  if (speed_control_mode) {
+    ROS_INFO_STREAM(
+        "xESC control_mode=speed (opt-in): closed-loop ERPM on drive wheels. Ensure the "
+        "VESC speed PID (s_pid_*) is tuned and s_pid_min_erpm is low enough for slow turns.");
+  } else if (control_mode != "duty") {
+    ROS_WARN_STREAM("Unknown control_mode '" << control_mode << "', falling back to 'duty' (open loop).");
+  }
 
   speed_l = speed_r = speed_mow = target_speed_mow = 0;
 

@@ -128,3 +128,14 @@ void xesc_2040_driver::Xesc2040Driver::setDutyCycle(float duty_cycle) {
         xesc_interface->setDutyCycle(duty_cycle);
     }
 }
+
+// The xesc_2040 backend does not implement closed-loop ERPM speed control. Refuse safely:
+// log once and keep the motor stopped. This is only reachable if a user explicitly opts into
+// control_mode=speed on this board (default is duty), so it must never fail open or crash.
+void xesc_2040_driver::Xesc2040Driver::setSpeed(float erpm) {
+    ROS_ERROR_ONCE("xesc_2040 backend does not support closed-loop speed (ERPM) control. "
+                   "Refusing setSpeed and holding the motor stopped. Use control_mode=duty.");
+    if(xesc_interface) {
+        xesc_interface->setDutyCycle(0.0f);
+    }
+}

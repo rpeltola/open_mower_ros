@@ -19,6 +19,8 @@ namespace xesc_yfr4_driver  {
 
         void setDutyCycle(float duty_cycle) override;
 
+        void setSpeed(float erpm) override;
+
         void stop() override;
 
     private:

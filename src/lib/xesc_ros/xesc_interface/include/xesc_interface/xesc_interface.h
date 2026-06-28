@@ -14,6 +14,9 @@ namespace xesc_interface {
         virtual void getStatus(xesc_msgs::XescStateStamped &state)=0;
         virtual void getStatusBlocking(xesc_msgs::XescStateStamped &state)=0;
         virtual void setDutyCycle(float duty_cycle)=0;
+        // Closed-loop speed command in electrical RPM (ERPM). Backends that cannot do ERPM
+        // control must refuse safely (see implementations), never silently no-op or throw.
+        virtual void setSpeed(float erpm)=0;
         virtual void stop()=0;
 
     };

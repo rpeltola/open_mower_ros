@@ -50,6 +50,12 @@ void xesc_driver::XescDriver::setDutyCycle(float duty_cycle) {
     xesc_driver->setDutyCycle(duty_cycle);
 }
 
+void xesc_driver::XescDriver::setSpeed(float erpm) {
+    if (!xesc_driver)
+        return;
+    xesc_driver->setSpeed(erpm);
+}
+
 xesc_driver::XescDriver::~XescDriver() {
     if (xesc_driver) {
         delete xesc_driver;

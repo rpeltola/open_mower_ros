@@ -111,6 +111,12 @@ namespace vesc_driver {
         vesc_.setDutyCycle(duty_cycle);
     }
 
+    // Closed-loop speed control. The VESC firmware runs its own speed PID on the commanded
+    // ERPM (COMM_SET_ERPM); the wire path already exists in VescInterface::setSpeed.
+    void VescDriver::setSpeed(float erpm) {
+        vesc_.setSpeed(erpm);
+    }
+
 
     VescDriver::CommandLimit::CommandLimit(const ros::NodeHandle &nh, const std::string &str,
                                            const boost::optional<double> &min_lower,

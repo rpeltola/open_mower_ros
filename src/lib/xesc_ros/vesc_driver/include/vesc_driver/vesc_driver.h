@@ -63,6 +63,8 @@ public:
 
     void setDutyCycle(float duty_cycle) override;
 
+    void setSpeed(float erpm) override;
+
     VescDriver(ros::NodeHandle &nh, ros::NodeHandle &private_nh);
 
     void stop();

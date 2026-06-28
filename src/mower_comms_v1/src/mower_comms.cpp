@@ -131,6 +131,26 @@ inline double wheelSpeedToErpm(double v_wheel_mps, double ticks_per_m) {
 }
 
 void publishActuators() {
+  // Re-read control_mode at runtime (~1 Hz poll) so duty<->speed can be toggled live with
+  // `rosparam set /ll/control_mode {duty|speed}` without restarting the node. The startup read in
+  // main() still sets the initial value from the launch params.
+  static ros::Time last_mode_poll(0);
+  if ((ros::Time::now() - last_mode_poll).toSec() >= 1.0) {
+    last_mode_poll = ros::Time::now();
+    std::string mode;
+    if (ros::param::get("~control_mode", mode)) {
+      bool new_speed_mode = (mode == "speed");
+      if (new_speed_mode != speed_control_mode) {
+        speed_control_mode = new_speed_mode;
+        // Zero stale targets so we never emit an old value reinterpreted in the new mode's units.
+        speed_l = speed_r = 0;
+        erpm_l = erpm_r = 0;
+        ROS_INFO_STREAM("xESC control_mode switched to '" << (speed_control_mode ? "speed" : "duty")
+                                                          << "' at runtime.");
+      }
+    }
+  }
+
   speed_mow = target_speed_mow;
 
   // emergency or timeout -> send 0 speeds

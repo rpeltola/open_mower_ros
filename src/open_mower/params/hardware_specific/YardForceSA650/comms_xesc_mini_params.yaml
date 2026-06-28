@@ -1,12 +1,12 @@
 left_xesc:
   xesc_type: "xesc_mini"
   serial_port: "/dev/ttyAMA5"
-  motor_pole_pairs: 4  # Just needed for eRPM to RPM calculation
+  motor_pole_pairs: 7  # Linix 35ZWN18 drive motor is 14-pole (7 pole pairs). Used for eRPM->RPM telemetry.
   has_motor_temp: false
 right_xesc:
   xesc_type: "xesc_mini"
   serial_port: "/dev/ttyAMA3"
-  motor_pole_pairs: 4  # Just needed for eRPM to RPM calculation
+  motor_pole_pairs: 7  # Linix 35ZWN18 drive motor is 14-pole (7 pole pairs). Used for eRPM->RPM telemetry.
   has_motor_temp: false
 mower_xesc:
   xesc_type: "xesc_mini"

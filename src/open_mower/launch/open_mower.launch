@@ -12,6 +12,7 @@
     <node pkg="mower_logic" type="mower_logic" name="mower_logic" output="screen" respawn="true" respawn_delay="10">
     </node>
     <node pkg="slic3r_coverage_planner" type="slic3r_coverage_planner" name="slic3r_coverage_planner" output="screen" respawn="true" respawn_delay="10"/>
+    <node pkg="coverage_feedback" type="coverage_feedback" name="coverage_feedback" output="screen" respawn="true" respawn_delay="10"/>
 
     <node pkg="twist_mux" type="twist_mux" name="twist_mux" output="screen" respawn="true" respawn_delay="10">
         <remap from="cmd_vel_out" to="/ll/cmd_vel"/>

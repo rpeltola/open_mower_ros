@@ -37,6 +37,7 @@
 #include "behaviors/IdleBehavior.h"
 #include "behaviors/PerimeterDocking.h"
 #include "ftc_local_planner/PlannerGetProgress.h"
+#include "coverage_feedback/GetFillPaths.h"
 #include "mbf_msgs/ExePathAction.h"
 #include "mbf_msgs/MoveBaseAction.h"
 #include "mbf_msgs/RecoveryAction.h"
@@ -75,7 +76,8 @@ std::string current_session_id;
 bool current_job_finished = false;
 
 ros::ServiceClient pathClient, mapClient, dockingPointClient, gpsClient, mowClient, emergencyClient, pathProgressClient,
-    setNavPointClient, clearNavPointClient, clearMapClient, positioningClient, actionRegistrationClient;
+    setNavPointClient, clearNavPointClient, clearMapClient, positioningClient, actionRegistrationClient,
+    coverageFeedbackClient;
 
 ros::NodeHandle* n;
 ros::NodeHandle* paramNh;
@@ -764,6 +766,8 @@ int main(int argc, char** argv) {
 
   setNavPointClient = n->serviceClient<mower_map::SetNavPointSrv>("mower_map_service/set_nav_point");
   clearNavPointClient = n->serviceClient<mower_map::ClearNavPointSrv>("mower_map_service/clear_nav_point");
+
+  coverageFeedbackClient = n->serviceClient<coverage_feedback::GetFillPaths>("coverage_feedback/get_fill_paths");
 
   mbfClient = new actionlib::SimpleActionClient<mbf_msgs::MoveBaseAction>("/move_base_flex/move_base");
   mbfClientExePath = new actionlib::SimpleActionClient<mbf_msgs::ExePathAction>("/move_base_flex/exe_path");

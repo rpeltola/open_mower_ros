@@ -3,6 +3,10 @@ ll:
     diff_drive:
       wheel_distance_m: 0.325
       ticks_per_m: 1964.0
+      # Power down the drive ESCs when idle and the tilt is below this many
+      # degrees, so they cool down. Above it the wheels keep holding torque so
+      # the mower can't roll on a slope. 0 disables the feature.
+      shutdown_esc_max_pitch: 20
     power:
       battery_full_voltage: 28.5
       battery_empty_voltage: 24.0

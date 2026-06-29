@@ -161,6 +161,16 @@ int main(int argc, char** argv) {
   ROS_INFO_STREAM("Wheel ticks [1/m]: " << wheel_ticks_per_m);
   ROS_INFO_STREAM("Wheel distance [m]: " << wheel_distance_m);
 
+  // Optional: max pitch (deg) below which the drive ESCs are powered down when
+  // idle (0 = disabled). Defaults to 0 so robots that don't set it are unaffected.
+  int shutdown_esc_max_pitch = 0;
+  paramNh.param("services/diff_drive/shutdown_esc_max_pitch", shutdown_esc_max_pitch, 0);
+  if (shutdown_esc_max_pitch < 0 || shutdown_esc_max_pitch > 180) {
+    ROS_ERROR("services/diff_drive/shutdown_esc_max_pitch must be in [0, 180], got %d", shutdown_esc_max_pitch);
+    return 1;
+  }
+  ROS_INFO_STREAM("Shutdown ESC max pitch [deg]: " << shutdown_esc_max_pitch);
+
   int baud_rate = 0;
   paramNh.getParam("services/gps/baud_rate", baud_rate);
 
@@ -178,9 +188,9 @@ int main(int argc, char** argv) {
   ROS_INFO_STREAM("GPS protocol: " << protocol << ", baud rate: " << baud_rate
                                    << ", gps port index:" << gps_port_index);
 
-  diff_drive_service = std::make_unique<DiffDriveServiceInterface>(xbot::service_ids::DIFF_DRIVE, ctx, actual_twist_pub,
-                                                                   status_left_esc_pub, status_right_esc_pub,
-                                                                   wheel_ticks_per_m, wheel_distance_m);
+  diff_drive_service = std::make_unique<DiffDriveServiceInterface>(
+      xbot::service_ids::DIFF_DRIVE, ctx, actual_twist_pub, status_left_esc_pub, status_right_esc_pub,
+      wheel_ticks_per_m, wheel_distance_m, static_cast<uint8_t>(shutdown_esc_max_pitch));
   diff_drive_service->Start();
 
   // Mower service

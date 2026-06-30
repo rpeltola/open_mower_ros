@@ -176,9 +176,6 @@ class CoverageFeedback {
     try {
       planned_path_plan_ = json::parse(msg->data);
       have_planned_path_ = true;
-      // Pre-size the grid to the whole plan up front so per-pose stamping never has to re-anchor the
-      // origin mid-mow (which makes the app's coverage overlay twitch). One growth instead of many.
-      preallocateForPlan(planned_path_plan_);
     } catch (const json::exception& e) {
       ROS_WARN_STREAM("coverage_feedback: ignoring malformed planned_path: " << e.what());
     }
@@ -188,13 +185,15 @@ class CoverageFeedback {
     std::lock_guard<std::mutex> lock(mutex_);
     const double x = msg->pose.pose.position.x;
     const double y = msg->pose.pose.position.y;
-    // Record the EKF track for the current pass (blades == actively mowing) so actual_track.json can be
-    // segmented into blade-on / blade-off runs at the next pass write.
-    track_.push_back({x, y, mowing_active_});
-    if (!mowing_active_) {
+    if (!mowing_active_) {  // idle/transit: don't track or stamp (position_history has the full path)
       have_prev_ = false;
       return;
     }
+    if (have_prev_ && std::hypot(x - prev_x_, y - prev_y_) > kMaxJump_) {  // GPS/EKF outlier
+      ROS_WARN_STREAM_THROTTLE(5.0, "coverage_feedback: rejecting outlier pose jump > " << kMaxJump_ << " m");
+      return;
+    }
+    track_.push_back({x, y, true});
     stamp(x, y);
   }
 
@@ -227,32 +226,6 @@ class CoverageFeedback {
     }
   }
 
-  // Expand the grid once to cover the slic3r plan (plus turn/overshoot headroom), so subsequent
-  // per-pose stamping stays inside the allocated extent and the published origin stays put — without
-  // this the grid re-anchors its origin pose-by-pose and the app's coverage overlay twitches.
-  void preallocateForPlan(const json& plan) {
-    if (!plan.contains("paths") || !plan["paths"].is_array()) return;
-    double min_x = 1e9, min_y = 1e9, max_x = -1e9, max_y = -1e9;
-    bool any = false;
-    for (const auto& path : plan["paths"]) {
-      if (!path.contains("points") || !path["points"].is_array()) continue;
-      for (const auto& pt : path["points"]) {
-        if (!pt.is_array() || pt.size() < 2) continue;
-        const double px = pt[0].get<double>(), py = pt[1].get<double>();
-        min_x = std::min(min_x, px);
-        max_x = std::max(max_x, px);
-        min_y = std::min(min_y, py);
-        max_y = std::max(max_y, py);
-        any = true;
-      }
-    }
-    if (!any) return;
-    // Pad beyond the plan so EKF overshoot at lane-end turns stays inside the allocated grid.
-    constexpr double kPlanPad = 2.0;  // metres (on top of ensureContains' own kMargin slack)
-    ensureContains(min_x - kPlanPad, min_y - kPlanPad);
-    ensureContains(max_x + kPlanPad, max_y + kPlanPad);
-  }
-
   cv::Point toCell(double x, double y) const {
     return cv::Point(static_cast<int>(std::round((x - origin_x_) / res_)),
                      static_cast<int>(std::round((y - origin_y_) / res_)));
@@ -271,6 +244,7 @@ class CoverageFeedback {
     prev_x_ = x;
     prev_y_ = y;
     have_prev_ = true;
+    grid_dirty_ = true;
   }
 
   // Publish a zero-size grid so the MQTT bridge clears the retained coverage layer: on a new job the
@@ -289,6 +263,7 @@ class CoverageFeedback {
   void publishGrid(const ros::TimerEvent&) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) return;
+    if (!grid_dirty_) return;
     nav_msgs::OccupancyGrid msg;
     msg.header.stamp = ros::Time::now();
     msg.header.frame_id = map_frame_;
@@ -307,6 +282,7 @@ class CoverageFeedback {
       }
     }
     grid_pub_.publish(msg);
+    grid_dirty_ = false;
 
     // Periodically refresh latest.yml.gz so a respawn after a crash resumes with near-current coverage
     // even if no GetFillPaths call happened since the last save. Throttled to avoid gzip churn at 1 Hz.
@@ -992,8 +968,10 @@ class CoverageFeedback {
   std::mutex mutex_;
   cv::Mat grid_;
   bool initialized_ = false;
+  bool grid_dirty_ = false;
   double origin_x_ = 0.0;
   double origin_y_ = 0.0;
+  double kMaxJump_ = 2.0;  // metres; reject EKF/GPS teleports
 
   // --- disk persistence ---
   int pass_index_ = 0;      // per-job pass counter (pass<N> snapshot dir); restored on resume

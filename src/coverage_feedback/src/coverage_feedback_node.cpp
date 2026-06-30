@@ -796,8 +796,7 @@ class CoverageFeedback {
     // Window column/row -> world-cell index: c = floor(x/res) - cwx0. Cell (c,r) covers world cell
     // (cwx0+c, cwy0+r); its centre in world coords is ((cwx0+c)+0.5)*res, ((cwy0+r)+0.5)*res.
     auto worldToWin = [&](double x, double y) {
-      return cv::Point(static_cast<int>(std::floor(x / res_)) - cwx0,
-                       static_cast<int>(std::floor(y / res_)) - cwy0);
+      return cv::Point(static_cast<int>(std::floor(x / res_)) - cwx0, static_cast<int>(std::floor(y / res_)) - cwy0);
     };
 
     // --- target = area minus obstacles, eroded by erosion_margin ---

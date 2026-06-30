@@ -46,6 +46,8 @@ extern void setConfig(mower_logic::MowerLogicConfig);
 extern void registerActions(std::string prefix, const std::vector<xbot_msgs::ActionInfo>& actions);
 
 extern std::string current_job_id;
+extern std::string current_session_id;
+extern std::string generateNanoId(size_t length);
 extern bool current_job_finished;
 
 MowingBehavior MowingBehavior::INSTANCE;
@@ -151,6 +153,10 @@ bool MowingBehavior::request_coverage_refill() {
   }
 
   refill_round++;
+  // A fix-up (refill) pass is a new SESSION within the same job (Option 1): the job_id is kept so
+  // the cumulative coverage carries over and all passes group under one job, while a fresh
+  // session_id makes this pass's driven track recordable distinctly (same model as pause/resume).
+  current_session_id = generateNanoId(32);
   ROS_INFO_STREAM("MowingBehavior: coverage refill round " << refill_round << "/" << getConfig().max_refill_rounds
                                                            << " - " << srv.response.gap_count << " gap(s), "
                                                            << srv.response.uncovered_area << " m^2 to re-mow.");

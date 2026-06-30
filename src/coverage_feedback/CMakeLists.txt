@@ -61,6 +61,10 @@ catkin_package(
 ## Build ##
 ###########
 
+## nlohmann/json for the per-pass replay JSON (coverage/planned_path/actual_track/meta), matching how
+## mower_map and mower_logic pull it in from the in-tree copy.
+add_subdirectory(../lib/json json EXCLUDE_FROM_ALL)
+
 include_directories(
         ${catkin_INCLUDE_DIRS}
         ${OpenCV_INCLUDE_DIRS}
@@ -68,4 +72,6 @@ include_directories(
 
 add_executable(coverage_feedback src/coverage_feedback_node.cpp)
 add_dependencies(coverage_feedback ${catkin_EXPORTED_TARGETS} ${${PROJECT_NAME}_EXPORTED_TARGETS})
-target_link_libraries(coverage_feedback ${catkin_LIBRARIES} ${OpenCV_LIBS})
+## stdc++fs: std::filesystem (used for on-disk coverage persistence) needs an explicit link on
+## GCC < 9; on the GCC 9 toolchain Noetic targets it is a harmless empty stub.
+target_link_libraries(coverage_feedback ${catkin_LIBRARIES} ${OpenCV_LIBS} stdc++fs nlohmann_json::nlohmann_json)

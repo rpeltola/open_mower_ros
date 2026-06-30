@@ -38,21 +38,30 @@
 #include <ros/ros.h>
 #include <slic3r_coverage_planner/PlanPath.h>
 #include <std_msgs/Header.h>
+#include <std_msgs/String.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <xbot_msgs/AbsolutePose.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <opencv2/opencv.hpp>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "coverage_feedback/CoverageStatus.h"
 #include "coverage_feedback/GetFillPaths.h"
 
 namespace {
+
+using json = nlohmann::ordered_json;
 
 // Marker values for the single-channel coverage grid (CV_8UC1).
 constexpr unsigned char CELL_COVERED = 255;
@@ -82,6 +91,8 @@ class CoverageFeedback {
     // Reset the coverage grid when a new mowing job starts so stale coverage from a previous job
     // (e.g. yesterday's mow, with the node still running) is not mistaken for freshly cut ground.
     state_sub_ = nh.subscribe(state_topic_, 10, &CoverageFeedback::onState, this);
+    // Latest slic3r mow plan (latched), kept so pass 0's planned_path.json mirrors what was actually mowed.
+    planned_path_sub_ = nh.subscribe("mower_logic/planned_path", 1, &CoverageFeedback::onPlannedPath, this);
     fill_service_ = private_nh.advertiseService("get_fill_paths", &CoverageFeedback::onGetFillPaths, this);
 
     if (publish_grid_) {
@@ -116,13 +127,37 @@ class CoverageFeedback {
 
   void onState(const mower_msgs::HighLevelStatus::ConstPtr& msg) {
     std::lock_guard<std::mutex> lock(mutex_);
-    // A new, non-empty job id means a fresh mow: drop accumulated coverage. Resuming the same job
-    // after a dock keeps the same id, so the grid (and thus per-area progress) is preserved.
+    // When the mow ends (high-level state leaves AUTONOMOUS, e.g. docking/idle), persist the current
+    // job's FINAL coverage as a pass even if it never reached an area-completion/refill. This is what
+    // lands every real mow in coverage history (refill passes are still persisted per get_fill_paths).
+    const bool left_autonomous = prev_state_ == mower_msgs::HighLevelStatus::HIGH_LEVEL_STATE_AUTONOMOUS &&
+                                 msg->state != mower_msgs::HighLevelStatus::HIGH_LEVEL_STATE_AUTONOMOUS;
+    prev_state_ = msg->state;
+    if (left_autonomous && initialized_ && !last_job_id_.empty()) {
+      ROS_INFO_STREAM("coverage_feedback: job '" << last_job_id_ << "' ended - persisting final coverage (pass "
+                                                 << pass_index_ << ").");
+      persistPass({}, {}, finalStatus());
+    }
+    // A new, non-empty job id means we switched jobs. Because this node has respawn=true, a crash or
+    // charge-reboot mid-mow restarts it with empty in-RAM state; on the next state message it sees the
+    // current (unchanged) job id as "new" and would wipe coverage that was already cut. To stay correct
+    // we persist the grid to disk per job and, on a job-id change, prefer resuming from disk over reset.
+    // Resuming the same job after a dock keeps the same id, so nothing changes there either.
     if (!msg->job_id.empty() && msg->job_id != last_job_id_) {
-      if (initialized_) {
-        ROS_INFO_STREAM("coverage_feedback: new job '" << msg->job_id << "' - resetting coverage grid.");
+      last_job_id_ = msg->job_id;
+      // The per-pass track buffer and the cached pass-0 plan belong to the previous job: drop them so
+      // the new job records its own. The new job's plan re-publishes when slic3r planning runs.
+      track_.clear();
+      planned_path_plan_ = json::object();
+      have_planned_path_ = false;
+      if (loadLatest(msg->job_id)) {
+        ROS_INFO_STREAM("coverage_feedback: resuming job '" << msg->job_id << "' from disk (pass " << pass_index_
+                                                            << ", grid " << grid_.cols << "x" << grid_.rows << ").");
+      } else {
+        ROS_INFO_STREAM("coverage_feedback: new job '" << msg->job_id << "' - starting fresh coverage grid.");
+        resetGrid();
       }
-      resetGrid();
+      return;
     }
     last_job_id_ = msg->job_id;
   }
@@ -131,16 +166,31 @@ class CoverageFeedback {
     grid_.release();
     initialized_ = false;
     have_prev_ = false;
+    pass_index_ = 0;
+  }
+
+  // Cache the latest slic3r mow plan (JSON {job_id, paths:[{is_outline, points}]}) for pass-0 replay.
+  void onPlannedPath(const std_msgs::String::ConstPtr& msg) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    try {
+      planned_path_plan_ = json::parse(msg->data);
+      have_planned_path_ = true;
+    } catch (const json::exception& e) {
+      ROS_WARN_STREAM("coverage_feedback: ignoring malformed planned_path: " << e.what());
+    }
   }
 
   void onPose(const xbot_msgs::AbsolutePose::ConstPtr& msg) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const double x = msg->pose.pose.position.x;
+    const double y = msg->pose.pose.position.y;
+    // Record the EKF track for the current pass (blades == actively mowing) so actual_track.json can be
+    // segmented into blade-on / blade-off runs at the next pass write.
+    track_.push_back({x, y, mowing_active_});
     if (!mowing_active_) {
       have_prev_ = false;
       return;
     }
-    const double x = msg->pose.pose.position.x;
-    const double y = msg->pose.pose.position.y;
     stamp(x, y);
   }
 
@@ -214,6 +264,106 @@ class CoverageFeedback {
       }
     }
     grid_pub_.publish(msg);
+
+    // Periodically refresh latest.yml.gz so a respawn after a crash resumes with near-current coverage
+    // even if no GetFillPaths call happened since the last save. Throttled to avoid gzip churn at 1 Hz.
+    constexpr int kSaveEverySeconds = 10;
+    if (++save_tick_ >= kSaveEverySeconds) {
+      save_tick_ = 0;
+      saveLatest();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Disk persistence (per-job grid + per-pass snapshots, rooted at ROS_HOME)
+  // -------------------------------------------------------------------------
+  // <ROS_HOME or $HOME/.ros>/coverage
+  std::string coverageRoot() const {
+    const char* ros_home = std::getenv("ROS_HOME");
+    if (ros_home && ros_home[0] != '\0') return std::string(ros_home) + "/coverage";
+    const char* home = std::getenv("HOME");
+    const std::string base = (home && home[0] != '\0') ? std::string(home) : std::string(".");
+    return base + "/.ros/coverage";
+  }
+
+  std::string jobDir(const std::string& job_id) const {
+    return coverageRoot() + "/" + job_id;
+  }
+
+  // Serialize the live grid + georeferencing + pass counter via cv::FileStorage. Must hold mutex_.
+  static void writeGrid(cv::FileStorage& fs, const cv::Mat& grid, double origin_x, double origin_y, double res,
+                        int pass_index) {
+    fs << "grid" << grid;
+    fs << "origin_x" << origin_x;
+    fs << "origin_y" << origin_y;
+    fs << "res" << res;
+    fs << "pass_index" << pass_index;
+  }
+
+  // Atomically (write-to-temp + rename) refresh <job>/latest.yml.gz from the current grid. Must hold mutex_.
+  void saveLatest() {
+    if (!initialized_ || last_job_id_.empty()) return;
+    const std::string dir = jobDir(last_job_id_);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+      ROS_WARN_STREAM("coverage_feedback: cannot create job dir '" << dir << "': " << ec.message());
+      return;
+    }
+    const std::string final_path = dir + "/latest.yml.gz";
+    const std::string tmp_path = dir + "/latest.tmp.yml.gz";  // keep .yml.gz so OpenCV gzips it
+    try {
+      cv::FileStorage fs(tmp_path, cv::FileStorage::WRITE);
+      if (!fs.isOpened()) {
+        ROS_WARN_STREAM("coverage_feedback: cannot open '" << tmp_path << "' for writing.");
+        return;
+      }
+      writeGrid(fs, grid_, origin_x_, origin_y_, res_, pass_index_);
+      fs.release();
+    } catch (const cv::Exception& e) {
+      ROS_WARN_STREAM("coverage_feedback: failed to write latest grid: " << e.what());
+      return;
+    }
+    std::filesystem::rename(tmp_path, final_path, ec);
+    if (ec) {
+      ROS_WARN_STREAM("coverage_feedback: cannot finalize '" << final_path << "': " << ec.message());
+    }
+  }
+
+  // Restore grid_ + georeferencing + pass counter from <job>/latest.yml.gz. Returns false (leaving state
+  // untouched) if there is no usable saved data. Must hold mutex_.
+  bool loadLatest(const std::string& job_id) {
+    const std::string path = jobDir(job_id) + "/latest.yml.gz";
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) return false;
+    try {
+      cv::FileStorage fs(path, cv::FileStorage::READ);
+      if (!fs.isOpened()) return false;
+      cv::Mat g;
+      fs["grid"] >> g;
+      if (g.empty() || g.type() != CV_8UC1) {
+        ROS_WARN_STREAM("coverage_feedback: '" << path << "' has no usable grid - starting fresh.");
+        return false;
+      }
+      double ox = origin_x_, oy = origin_y_, rr = res_;
+      int pass = 0;
+      fs["origin_x"] >> ox;
+      fs["origin_y"] >> oy;
+      fs["res"] >> rr;
+      fs["pass_index"] >> pass;
+      fs.release();
+      grid_ = g;
+      origin_x_ = ox;
+      origin_y_ = oy;
+      if (rr > 0.0) res_ = rr;  // keep the grid self-consistent with the resolution it was built at
+      pass_index_ = pass;
+      initialized_ = true;
+      have_prev_ = false;
+      return true;
+    } catch (const cv::Exception& e) {
+      ROS_WARN_STREAM("coverage_feedback: failed to load '" << path << "': " << e.what());
+      return false;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -332,6 +482,210 @@ class CoverageFeedback {
       for (const auto& ps : p.path.poses) path.poses.push_back(ps);
     }
     fill_paths_pub_.publish(path);
+  }
+
+  // Dump the detected gap clusters (map-frame) for a future app timeline view. Best-effort.
+  void writeGapsJson(const std::string& path, const std::vector<GapViz>& gaps) const {
+    std::ofstream os(path);
+    if (!os) return;
+    os.precision(9);
+    os << "[\n";
+    for (size_t i = 0; i < gaps.size(); ++i) {
+      const auto& g = gaps[i];
+      os << "  {\"angle\": " << g.angle << ", \"area_m2\": " << g.area_m2 << ", \"cx\": " << g.cx
+         << ", \"cy\": " << g.cy << ", \"polygon\": [";
+      for (size_t j = 0; j < g.polygon.points.size(); ++j) {
+        const auto& p = g.polygon.points[j];
+        os << "[" << p.x << ", " << p.y << "]";
+        if (j + 1 < g.polygon.points.size()) os << ", ";
+      }
+      os << "]}";
+      if (i + 1 < gaps.size()) os << ",";
+      os << "\n";
+    }
+    os << "]\n";
+  }
+
+  // Dump the slic3r fill paths (map-frame polylines) for that pass. Best-effort.
+  void writeFillPathsJson(const std::string& path, const std::vector<slic3r_coverage_planner::Path>& paths) const {
+    std::ofstream os(path);
+    if (!os) return;
+    os.precision(9);
+    os << "[\n";
+    for (size_t i = 0; i < paths.size(); ++i) {
+      const auto& poses = paths[i].path.poses;
+      os << "  [";
+      for (size_t j = 0; j < poses.size(); ++j) {
+        os << "[" << poses[j].pose.position.x << ", " << poses[j].pose.position.y << "]";
+        if (j + 1 < poses.size()) os << ", ";
+      }
+      os << "]";
+      if (i + 1 < paths.size()) os << ",";
+      os << "\n";
+    }
+    os << "]\n";
+  }
+
+  // Atomically (write-to-temp + rename) write a JSON document to `path`. Best-effort. Must hold mutex_.
+  static void writeJsonAtomic(const std::string& path, const json& j) {
+    const std::string tmp = path + ".tmp";
+    {
+      std::ofstream os(tmp);
+      if (!os) return;
+      os << j.dump();
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+      ROS_WARN_STREAM("coverage_feedback: cannot finalize '" << path << "': " << ec.message());
+    }
+  }
+
+  // Run-length encode the live grid as the app's coverage layer (the same {res, w, h, ox, oy, rle} scheme
+  // xbot_monitoring emits for map_layers/coverage/json: row-major, 100 = covered, 0 = uncovered). The app
+  // can render the pass without OpenCV. Must hold mutex_.
+  json coverageJson() const {
+    json j;
+    j["res"] = res_;
+    j["w"] = grid_.cols;
+    j["h"] = grid_.rows;
+    // ox/oy are the real-world pose of the (0,0) cell corner, matching the published OccupancyGrid.
+    j["ox"] = origin_x_ - res_ / 2.0;
+    j["oy"] = origin_y_ - res_ / 2.0;
+    json rle = json::array();
+    int cur = 0;
+    uint32_t cnt = 0;
+    bool first = true;
+    for (int r = 0; r < grid_.rows; ++r) {
+      const unsigned char* row = grid_.ptr<unsigned char>(r);
+      for (int c = 0; c < grid_.cols; ++c) {
+        const int v = row[c] ? 100 : 0;
+        if (first) {
+          cur = v;
+          cnt = 1;
+          first = false;
+        } else if (v == cur) {
+          cnt++;
+        } else {
+          rle.push_back(cur);
+          rle.push_back(static_cast<int>(cnt));
+          cur = v;
+          cnt = 1;
+        }
+      }
+    }
+    if (!first) {
+      rle.push_back(cur);
+      rle.push_back(static_cast<int>(cnt));
+    }
+    j["rle"] = rle;
+    return j;
+  }
+
+  // planned_path.json: pass 0 replays the slic3r mow plan; pass N>=1 replays this node's fill paths.
+  // Must hold mutex_.
+  void writePlannedPathJson(const std::string& path, const std::vector<slic3r_coverage_planner::Path>& paths) const {
+    json j;
+    j["job_id"] = last_job_id_;
+    j["pass"] = pass_index_;
+    if (pass_index_ == 0) {
+      j["paths"] =
+          (have_planned_path_ && planned_path_plan_.contains("paths")) ? planned_path_plan_["paths"] : json::array();
+    } else {
+      json arr = json::array();
+      for (const auto& p : paths) {
+        json pts = json::array();
+        for (const auto& ps : p.path.poses) pts.push_back({ps.pose.position.x, ps.pose.position.y});
+        arr.push_back({{"is_outline", false}, {"points", pts}});
+      }
+      j["paths"] = arr;
+    }
+    writeJsonAtomic(path, j);
+  }
+
+  // actual_track.json: the accumulated EKF track segmented into runs of constant blade state. Must hold mutex_.
+  void writeActualTrackJson(const std::string& path) const {
+    json j;
+    j["job_id"] = last_job_id_;
+    j["pass"] = pass_index_;
+    json segments = json::array();
+    size_t i = 0;
+    while (i < track_.size()) {
+      const bool blades = track_[i].blades;
+      json pts = json::array();
+      size_t k = i;
+      for (; k < track_.size() && track_[k].blades == blades; ++k) pts.push_back({track_[k].x, track_[k].y});
+      segments.push_back({{"blades", blades}, {"points", pts}});
+      i = k;
+    }
+    j["segments"] = segments;
+    writeJsonAtomic(path, j);
+  }
+
+  // meta.json: the small per-pass summary (epoch timestamp + stats the node already computed). Must hold mutex_.
+  void writeMetaJson(const std::string& path, const coverage_feedback::CoverageStatus& status) const {
+    json j;
+    j["job_id"] = last_job_id_;
+    j["pass"] = pass_index_;
+    j["timestamp"] = static_cast<long>(std::time(nullptr));
+    j["coverage_percent"] = status.coverage_percent;
+    j["gap_count"] = status.gap_count;
+    writeJsonAtomic(path, j);
+  }
+
+  // Lightweight CoverageStatus for an end-of-job snapshot. The full gap analysis (and the area mask
+  // it needs) only exists inside get_fill_paths, so here we report the covered area straight from the
+  // grid and an approximate percent over the grid extent. The grid snapshot itself is exact. Hold mutex_.
+  coverage_feedback::CoverageStatus finalStatus() const {
+    coverage_feedback::CoverageStatus s;
+    if (initialized_) {
+      const double cell_area = res_ * res_;
+      const double covered = static_cast<double>(cv::countNonZero(grid_)) * cell_area;
+      const double total = static_cast<double>(grid_.cols) * static_cast<double>(grid_.rows) * cell_area;
+      s.covered_area = covered;
+      s.target_area = total;
+      s.uncovered_area = total > covered ? total - covered : 0.0;
+      s.coverage_percent = total > 0.0 ? 100.0 * covered / total : 0.0;
+      s.gap_count = 0;
+    }
+    return s;
+  }
+
+  // Write an immutable snapshot of the just-completed pass into <job>/pass<N>/ (grid + meta + JSON),
+  // then advance the pass counter and refresh latest.yml.gz so a resume continues at the next pass.
+  // Must hold mutex_.
+  void persistPass(const std::vector<GapViz>& gaps, const std::vector<slic3r_coverage_planner::Path>& paths,
+                   const coverage_feedback::CoverageStatus& status) {
+    if (!initialized_ || last_job_id_.empty()) return;
+    const std::string dir = jobDir(last_job_id_) + "/pass" + std::to_string(pass_index_);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+      ROS_WARN_STREAM("coverage_feedback: cannot create pass dir '" << dir << "': " << ec.message());
+    } else {
+      try {
+        cv::FileStorage fs(dir + "/grid.yml.gz", cv::FileStorage::WRITE);
+        if (fs.isOpened()) {
+          writeGrid(fs, grid_, origin_x_, origin_y_, res_, pass_index_);
+          fs << "covered_area" << status.covered_area;
+          fs << "uncovered_area" << status.uncovered_area;
+          fs << "gap_count" << status.gap_count;
+          fs.release();
+        }
+      } catch (const cv::Exception& e) {
+        ROS_WARN_STREAM("coverage_feedback: failed to write pass grid: " << e.what());
+      }
+      writeGapsJson(dir + "/gaps.json", gaps);
+      writeFillPathsJson(dir + "/fill_paths.json", paths);
+      // Per-pass triplet (+ meta) so every mow attempt can be visualized identically to the first.
+      writeJsonAtomic(dir + "/coverage.json", coverageJson());
+      writePlannedPathJson(dir + "/planned_path.json", paths);
+      writeActualTrackJson(dir + "/actual_track.json");
+      writeMetaJson(dir + "/meta.json", status);
+    }
+    track_.clear();  // start the next pass's track fresh, whether or not the snapshot wrote cleanly
+    ++pass_index_;   // latest now points at the *next* pass index, so a resume won't overwrite this one
+    saveLatest();
   }
 
   // -------------------------------------------------------------------------
@@ -461,6 +815,7 @@ class CoverageFeedback {
                                             << ") - no refill.");
       clearGaps(hdr);
       emitStatus(false);
+      persistPass({}, {}, status);
       return true;
     }
 
@@ -527,6 +882,7 @@ class CoverageFeedback {
     publishGaps(gap_viz, hdr);
     publishFillPaths(res.paths, hdr);
     emitStatus(true);
+    persistPass(gap_viz, res.paths, status);
 
     ROS_INFO_STREAM("coverage_feedback: refill plan ready - " << res.gap_count << " gap(s), " << total_uncovered
                                                               << " m^2 uncovered, " << res.paths.size()
@@ -566,6 +922,7 @@ class CoverageFeedback {
   ros::Subscriber pose_sub_;
   ros::Subscriber status_sub_;
   ros::Subscriber state_sub_;
+  ros::Subscriber planned_path_sub_;
   ros::ServiceServer fill_service_;
   ros::ServiceClient plan_client_;
   ros::Publisher grid_pub_;
@@ -595,11 +952,26 @@ class CoverageFeedback {
   double origin_x_ = 0.0;
   double origin_y_ = 0.0;
 
+  // --- disk persistence ---
+  int pass_index_ = 0;      // per-job pass counter (pass<N> snapshot dir); restored on resume
+  int save_tick_ = 0;       // publishGrid timer ticks since the last periodic saveLatest()
+  uint8_t prev_state_ = 0;  // last HighLevelStatus.state (NULL); detects AUTONOMOUS->IDLE = job end
+
   bool mowing_active_ = false;
   bool have_prev_ = false;
   double prev_x_ = 0.0;
   double prev_y_ = 0.0;
   std::string last_job_id_;
+
+  // --- per-pass replay capture (written into pass<N>/ alongside the grid) ---
+  struct TrackPoint {
+    double x;
+    double y;
+    bool blades;
+  };
+  std::vector<TrackPoint> track_;  // EKF track for the in-progress pass; segmented + cleared at each write
+  json planned_path_plan_;         // latest mower_logic/planned_path payload (pass-0 plan)
+  bool have_planned_path_ = false;
 };
 
 }  // namespace

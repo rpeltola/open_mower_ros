@@ -6,9 +6,13 @@
 
 #include <algorithm>
 #include <boost/regex.hpp>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <system_error>
 #include <vector>
 
 #include "EventHistory.h"
@@ -16,6 +20,7 @@
 #include "PositionHistory.h"
 #include "capabilities.h"
 #include "geometry_msgs/Twist.h"
+#include "nav_msgs/OccupancyGrid.h"
 #include "ros/ros.h"
 #include "std_msgs/String.h"
 #include "xbot_mqtt/RegisterMethodsSrv.h"
@@ -43,6 +48,7 @@ void publish_capabilities();
 void publish_sensor_metadata();
 void publish_map();
 void publish_map_overlay();
+void publish_coverage();
 void publish_planned_path();
 void publish_actions();
 void publish_version();
@@ -89,6 +95,7 @@ class MqttCallback : public mqtt::callback {
         publish_sensor_metadata();
         publish_map();
         publish_map_overlay();
+        publish_coverage();
         publish_planned_path();
         publish_actions();
         publish_version();
@@ -152,12 +159,127 @@ json map;
 std::mutex map_mutex;
 json map_overlay;
 std::mutex map_overlay_mutex;
+json coverage_layer;
+std::mutex coverage_mutex;
 bool has_map = false;
 bool has_map_overlay = false;
+bool has_coverage = false;
 
 EventHistory event_history;
 PositionHistory position_history;
 PlannedPathHistory planned_path_history;
+
+// -----------------------------------------------------------------------------
+// Coverage per-pass history (read-only; written by the coverage_feedback node)
+// -----------------------------------------------------------------------------
+// The coverage node persists each completed mowing pass under
+// <ROS_HOME or $HOME/.ros>/coverage/<job_id>/pass<N>/{meta,coverage,planned_path,actual_track}.json.
+// These RPCs only read that tree; they never write it.
+static std::string coverage_history_root() {
+    const char* ros_home = std::getenv("ROS_HOME");
+    if (ros_home && ros_home[0] != '\0') return std::string(ros_home) + "/coverage";
+    const char* home = std::getenv("HOME");
+    const std::string base = (home && home[0] != '\0') ? std::string(home) : std::string(".");
+    return base + "/.ros/coverage";
+}
+
+// Parse and return a JSON file, or an empty object if it is missing/unreadable.
+static json read_json_or_empty(const std::filesystem::path& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return json::object();
+    try {
+        json j;
+        f >> j;
+        return j;
+    } catch (const json::exception&) {
+        return json::object();
+    }
+}
+
+// Parse a "pass<N>" directory name into its pass number. Returns false if it does not match.
+static bool parse_pass_number(const std::string& name, int& out) {
+    if (name.compare(0, 4, "pass") != 0 || name.size() <= 4) return false;
+    try {
+        size_t consumed = 0;
+        out = std::stoi(name.substr(4), &consumed);
+        return consumed == name.size() - 4;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Read the per-pass meta.json "timestamp" as epoch seconds (used only for ordering); 0 if absent.
+static int64_t coverage_meta_epoch(const json& meta) {
+    if (meta.is_object() && meta.contains("timestamp") && meta["timestamp"].is_number()) {
+        return static_cast<int64_t>(meta["timestamp"].get<double>());
+    }
+    return 0;
+}
+
+// List coverage history as [{job_id, passes:[{pass, timestamp, coverage_percent, gap_count}]}],
+// newest job first (by the newest pass timestamp). Jobs/passes without a meta.json are skipped.
+json list_coverage_histories() {
+    struct PassRow {
+        int pass;
+        int64_t epoch;
+        json summary;
+    };
+    struct JobEntry {
+        std::string job_id;
+        int64_t newest_epoch;
+        json passes;
+    };
+    std::vector<JobEntry> jobs;
+    std::error_code ec;
+    for (const auto& job_dir : std::filesystem::directory_iterator(coverage_history_root(), ec)) {
+        if (!job_dir.is_directory()) continue;
+        const std::string job_id = job_dir.path().filename().string();
+        if (job_id.empty()) continue;
+
+        std::vector<PassRow> rows;
+        std::error_code pec;
+        for (const auto& pass_dir : std::filesystem::directory_iterator(job_dir.path(), pec)) {
+            int pass = 0;
+            if (!pass_dir.is_directory() || !parse_pass_number(pass_dir.path().filename().string(), pass)) continue;
+            const json meta = read_json_or_empty(pass_dir.path() / "meta.json");
+            json summary = json::object();
+            summary["pass"] = pass;
+            summary["timestamp"] = meta.contains("timestamp") ? meta["timestamp"] : json(0);
+            summary["coverage_percent"] = meta.contains("coverage_percent") ? meta["coverage_percent"] : json(0);
+            summary["gap_count"] = meta.contains("gap_count") ? meta["gap_count"] : json(0);
+            rows.push_back({pass, coverage_meta_epoch(meta), std::move(summary)});
+        }
+        if (rows.empty()) continue;
+        std::sort(rows.begin(), rows.end(), [](const PassRow& a, const PassRow& b) { return a.pass < b.pass; });
+
+        int64_t newest = 0;
+        json passes = json::array();
+        for (auto& r : rows) {
+            newest = std::max(newest, r.epoch);
+            passes.push_back(std::move(r.summary));
+        }
+        jobs.push_back({job_id, newest, std::move(passes)});
+    }
+    std::sort(jobs.begin(), jobs.end(), [](const JobEntry& a, const JobEntry& b) { return a.newest_epoch > b.newest_epoch; });
+
+    json arr = json::array();
+    for (auto& j : jobs) {
+        arr.push_back({{"job_id", j.job_id}, {"passes", std::move(j.passes)}});
+    }
+    return arr;
+}
+
+// Return the four saved JSON artifacts of a single pass; each is {} if its file is missing.
+json get_coverage_pass(const std::string& job_id, int pass) {
+    const std::filesystem::path dir =
+        std::filesystem::path(coverage_history_root()) / job_id / ("pass" + std::to_string(pass));
+    return {
+        {"meta", read_json_or_empty(dir / "meta.json")},
+        {"coverage", read_json_or_empty(dir / "coverage.json")},
+        {"planned_path", read_json_or_empty(dir / "planned_path.json")},
+        {"actual_track", read_json_or_empty(dir / "actual_track.json")},
+    };
+}
 
 // clang-format off
 xbot_mqtt::RpcProvider rpc_provider("xbot_monitoring", {{
@@ -225,6 +347,22 @@ xbot_mqtt::RpcProvider rpc_provider("xbot_monitoring", {{
         } else {
             return planned_path_history.deleteHistory(std::nullopt);
         }
+    }),
+    RPC_METHOD("coverage.history.list", {
+        return list_coverage_histories();
+    }),
+    RPC_METHOD("coverage.history.pass", {
+        std::string job_id;
+        int pass = 0;
+        if (params.is_object()) {
+            if (params.contains("job_id") && params["job_id"].is_string()) {
+                job_id = params["job_id"].get<std::string>();
+            }
+            if (params.contains("pass") && params["pass"].is_number()) {
+                pass = params["pass"].get<int>();
+            }
+        }
+        return get_coverage_pass(job_id, pass);
     }),
 }});
 // clang-format on
@@ -702,6 +840,30 @@ void publish_map_overlay() {
     try_publish_binary("map_overlay/bson", bson.data(), bson.size(), true);
 }
 
+// Bridges the coverage_feedback OccupancyGrid (covered/not-covered cells in the map frame) to the
+// app. The grid is run-length encoded (cells are mostly long runs of the same value), so even a
+// large lawn stays small enough to stream at the grid's ~1 Hz update rate.
+void publish_coverage() {
+    json m;
+    {
+        std::lock_guard<std::mutex> lk(coverage_mutex);
+        if (!has_coverage) {
+            // No live coverage yet (fresh start / between jobs): clear any retained coverage so a
+            // stale grid from a previous job or sim run can't linger on the broker for new clients.
+            // The robot's own resume is disk-based and unaffected by this.
+            try_publish("map_layers/coverage/json", "", true);
+            try_publish_binary("map_layers/coverage/bson", "", 0, true);
+            return;
+        }
+        m = coverage_layer;
+    }
+    try_publish("map_layers/coverage/json", m.dump(), true);
+    json data;
+    data["d"] = m;
+    auto bson = json::to_bson(data);
+    try_publish_binary("map_layers/coverage/bson", bson.data(), bson.size(), true);
+}
+
 // Bridges the current slic3r mowing plan (whole-job: per-area boustrophedon outline + fill paths) to
 // the app as JSON, so it can be overlaid against the actually-driven track.
 void publish_planned_path() {
@@ -718,6 +880,43 @@ void publish_planned_path() {
     data["d"] = m;
     auto bson = json::to_bson(data);
     try_publish_binary("map_layers/planned_path/bson", bson.data(), bson.size(), true);
+}
+
+void coverage_callback(const nav_msgs::OccupancyGrid::ConstPtr &msg) {
+    json j;
+    j["res"] = msg->info.resolution;
+    j["w"] = msg->info.width;
+    j["h"] = msg->info.height;
+    j["ox"] = msg->info.origin.position.x;
+    j["oy"] = msg->info.origin.position.y;
+    j["stamp"] = msg->header.stamp.toSec();
+    // Run-length encode the row-major int8 data (values: 100 covered, 0 in-area-uncovered, -1 unknown)
+    // as a flat [value, count, value, count, ...] array.
+    json rle = json::array();
+    const auto &d = msg->data;
+    if (!d.empty()) {
+        int8_t cur = d[0];
+        uint32_t cnt = 1;
+        for (size_t i = 1; i < d.size(); i++) {
+            if (d[i] == cur) {
+                cnt++;
+            } else {
+                rle.push_back((int)cur);
+                rle.push_back((int)cnt);
+                cur = d[i];
+                cnt = 1;
+            }
+        }
+        rle.push_back((int)cur);
+        rle.push_back((int)cnt);
+    }
+    j["rle"] = rle;
+    {
+        std::lock_guard<std::mutex> lk(coverage_mutex);
+        coverage_layer = j;
+        has_coverage = true;
+    }
+    publish_coverage();
 }
 
 void map_callback(const std_msgs::String::ConstPtr &msg) {
@@ -919,6 +1118,7 @@ int main(int argc, char **argv) {
     ros::Subscriber robotStateSubscriber = n->subscribe("xbot_monitoring/robot_state", 10, robot_state_callback);
     ros::Subscriber mapSubscriber = n->subscribe("mower_map_service/json_map", 10, map_callback);
     ros::Subscriber mapOverlaySubscriber = n->subscribe("xbot_monitoring/map_overlay", 10, map_overlay_callback);
+    ros::Subscriber coverageSubscriber = n->subscribe("coverage_feedback/coverage_grid", 1, coverage_callback);
     ros::Subscriber plannedPathSubscriber = n->subscribe("mower_logic/planned_path", 10, planned_path_callback);
     ros::Subscriber poseSubscriber = n->subscribe("/xbot_positioning/xb_pose", 10, pose_callback);
     ros::Timer posePublishTimer = n->createTimer(ros::Duration(MQTT_POSITION_PUBLISH_INTERVAL), pose_publish_timer_callback);

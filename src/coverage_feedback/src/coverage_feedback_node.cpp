@@ -392,8 +392,7 @@ class CoverageFeedback {
     return added;
   }
 
-  // Atomically (write-to-temp + rename) refresh <job>/latest.json.gz from covered_. The snapshot JSON
-  // string is stored inside an OpenCV FileStorage (already a workspace dep) so it is gzipped for free.
+  // Atomically (write-to-temp + rename) refresh <job>/latest.json from covered_ as plain JSON.
   // Must hold mutex_.
   void saveLatest() {
     if (covered_.empty() || last_job_id_.empty()) return;
@@ -404,21 +403,25 @@ class CoverageFeedback {
       ROS_WARN_STREAM("coverage_feedback: cannot create job dir '" << dir << "': " << ec.message());
       return;
     }
-    const std::string final_path = dir + "/latest.json.gz";
-    const std::string tmp_path = dir + "/latest.tmp.json.gz";  // keep .json.gz so OpenCV gzips it
-    try {
-      cv::FileStorage fs(tmp_path, cv::FileStorage::WRITE);
-      if (!fs.isOpened()) {
+    const std::string final_path = dir + "/latest.json";
+    const std::string tmp_path = dir + "/latest.tmp.json";
+    {
+      // Plain JSON, not cv::FileStorage: the sparse snapshot can exceed OpenCV's FileStorage
+      // string-length limit (it failed with "The written string is too long").
+      std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+      if (!f.is_open()) {
         ROS_WARN_STREAM("coverage_feedback: cannot open '" << tmp_path << "' for writing.");
         return;
       }
-      fs << "res" << res_;
-      fs << "pass_index" << pass_index_;
-      fs << "snapshot" << snapshotJson().dump();
-      fs.release();
-    } catch (const cv::Exception& e) {
-      ROS_WARN_STREAM("coverage_feedback: failed to write latest snapshot: " << e.what());
-      return;
+      json doc;
+      doc["res"] = res_;
+      doc["pass_index"] = pass_index_;
+      doc["snapshot"] = snapshotJson();
+      f << doc.dump();
+      if (!f.good()) {
+        ROS_WARN_STREAM("coverage_feedback: failed to write '" << tmp_path << "'.");
+        return;
+      }
     }
     std::filesystem::rename(tmp_path, final_path, ec);
     if (ec) {
@@ -429,33 +432,22 @@ class CoverageFeedback {
   // Restore covered_ + pass counter from <job>/latest.json.gz. Returns false (leaving state untouched)
   // if there is no usable saved data. Must hold mutex_.
   bool loadLatest(const std::string& job_id) {
-    const std::string path = jobDir(job_id) + "/latest.json.gz";
+    const std::string path = jobDir(job_id) + "/latest.json";
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || ec) return false;
-    try {
-      cv::FileStorage fs(path, cv::FileStorage::READ);
-      if (!fs.isOpened()) return false;
-      std::string snap_str;
-      fs["snapshot"] >> snap_str;
-      double rr = res_;
-      int pass = 0;
-      fs["res"] >> rr;
-      fs["pass_index"] >> pass;
-      fs.release();
-      if (snap_str.empty()) {
-        ROS_WARN_STREAM("coverage_feedback: '" << path << "' has no usable snapshot - starting fresh.");
-        return false;
-      }
-      const json snap = json::parse(snap_str, nullptr, /*allow_exceptions=*/false);
-      if (rr > 0.0) res_ = rr;  // keep coverage self-consistent with the resolution it was built at
-      pass_index_ = pass;
-      const size_t n = loadSnapshot(snap);
-      have_prev_ = false;
-      return n > 0;
-    } catch (const cv::Exception& e) {
-      ROS_WARN_STREAM("coverage_feedback: failed to load '" << path << "': " << e.what());
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    const json doc = json::parse(f, nullptr, /*allow_exceptions=*/false);
+    if (doc.is_discarded() || !doc.contains("snapshot")) {
+      ROS_WARN_STREAM("coverage_feedback: '" << path << "' has no usable snapshot - starting fresh.");
       return false;
     }
+    const double rr = doc.value("res", res_);
+    if (rr > 0.0) res_ = rr;  // keep coverage self-consistent with the resolution it was built at
+    pass_index_ = doc.value("pass_index", 0);
+    const size_t n = loadSnapshot(doc["snapshot"]);
+    have_prev_ = false;
+    return n > 0;
   }
 
   // -------------------------------------------------------------------------

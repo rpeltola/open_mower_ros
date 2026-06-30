@@ -42,6 +42,7 @@ void publish_capabilities();
 void publish_sensor_metadata();
 void publish_map();
 void publish_map_overlay();
+void publish_planned_path();
 void publish_actions();
 void publish_version();
 void publish_params();
@@ -87,6 +88,7 @@ class MqttCallback : public mqtt::callback {
         publish_sensor_metadata();
         publish_map();
         publish_map_overlay();
+        publish_planned_path();
         publish_actions();
         publish_version();
         publish_params();
@@ -149,8 +151,11 @@ json map;
 std::mutex map_mutex;
 json map_overlay;
 std::mutex map_overlay_mutex;
+json planned_path;
+std::mutex planned_path_mutex;
 bool has_map = false;
 bool has_map_overlay = false;
+bool has_planned_path = false;
 
 EventHistory event_history;
 PositionHistory position_history;
@@ -681,6 +686,28 @@ void publish_map_overlay() {
     try_publish_binary("map_overlay/bson", bson.data(), bson.size(), true);
 }
 
+// Bridges the current slic3r mowing plan (per-area boustrophedon outline + fill paths) to the app
+// as JSON, so it can be overlaid against the actually-driven track.
+void publish_planned_path() {
+    json m;
+    {
+        std::lock_guard<std::mutex> lk(planned_path_mutex);
+        if (!has_planned_path) {
+            // No live plan yet: clear any retained planned path so a stale plan from a previous job
+            // or sim run can't linger for new clients (same rationale as the other map layers).
+            try_publish("map_layers/planned_path/json", "", true);
+            try_publish_binary("map_layers/planned_path/bson", "", 0, true);
+            return;
+        }
+        m = planned_path;
+    }
+    try_publish("map_layers/planned_path/json", m.dump(), true);
+    json data;
+    data["d"] = m;
+    auto bson = json::to_bson(data);
+    try_publish_binary("map_layers/planned_path/bson", bson.data(), bson.size(), true);
+}
+
 void map_callback(const std_msgs::String::ConstPtr &msg) {
     try {
         json m = json::parse(msg->data);
@@ -692,6 +719,22 @@ void map_callback(const std_msgs::String::ConstPtr &msg) {
         publish_map();
     } catch (const json::exception &e) {
         ROS_ERROR_STREAM("Error processing map JSON: " << e.what());
+    }
+}
+
+// Bridges the slic3r-planned mowing path (published as a JSON string by mower_logic) to the app so it
+// can draw the planned coverage path (grey) over the actual driven path.
+void planned_path_callback(const std_msgs::String::ConstPtr &msg) {
+    try {
+        json m = json::parse(msg->data);
+        {
+            std::lock_guard<std::mutex> lk(planned_path_mutex);
+            planned_path = m;
+            has_planned_path = true;
+        }
+        publish_planned_path();
+    } catch (const json::exception &e) {
+        ROS_ERROR_STREAM("Error processing planned path JSON: " << e.what());
     }
 }
 
@@ -866,6 +909,7 @@ int main(int argc, char **argv) {
     ros::Subscriber robotStateSubscriber = n->subscribe("xbot_monitoring/robot_state", 10, robot_state_callback);
     ros::Subscriber mapSubscriber = n->subscribe("mower_map_service/json_map", 10, map_callback);
     ros::Subscriber mapOverlaySubscriber = n->subscribe("xbot_monitoring/map_overlay", 10, map_overlay_callback);
+    ros::Subscriber plannedPathSubscriber = n->subscribe("mower_logic/planned_path", 1, planned_path_callback);
     ros::Subscriber poseSubscriber = n->subscribe("/xbot_positioning/xb_pose", 10, pose_callback);
     ros::Timer posePublishTimer = n->createTimer(ros::Duration(MQTT_POSITION_PUBLISH_INTERVAL), pose_publish_timer_callback);
     ros::Timer positionHistoryFlushTimer =

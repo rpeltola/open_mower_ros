@@ -230,6 +230,25 @@ bool MowingBehavior::create_mowing_plan(int area_index) {
 
   currentMowingPaths = pathSrv.response.paths;
 
+  // Publish the slic3r-planned mowing path (map frame, metres) as JSON so xbot_monitoring can bridge it
+  // to MQTT and the app can draw the planned coverage overlay (grey) over the actual driven path.
+  {
+    json planned;
+    planned["job_id"] = current_job_id;
+    planned["paths"] = json::array();
+    for (const auto& path : currentMowingPaths) {
+      json path_json;
+      path_json["is_outline"] = path.is_outline != 0;
+      json points = json::array();
+      for (const auto& pose_stamped : path.path.poses) {
+        points.push_back({pose_stamped.pose.position.x, pose_stamped.pose.position.y});
+      }
+      path_json["points"] = points;
+      planned["paths"].push_back(path_json);
+    }
+    publishPlannedPath(planned.dump());
+  }
+
   // Calculate mowing plan digest from the poses
   // TODO: move to slic3r_coverage_planner
   CryptoPP::SHA256 hash;

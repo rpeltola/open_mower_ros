@@ -11,6 +11,7 @@ find_package(OpenCV REQUIRED)
 find_package(catkin REQUIRED COMPONENTS
         roscpp
         std_msgs
+        std_srvs
         geometry_msgs
         nav_msgs
         visualization_msgs
@@ -47,6 +48,7 @@ catkin_package(
         CATKIN_DEPENDS
         roscpp
         std_msgs
+        std_srvs
         geometry_msgs
         nav_msgs
         visualization_msgs

@@ -18,42 +18,50 @@
 //
 //   A. Coverage tracker (always-on). Subscribes to the body pose and the low-level mower status and,
 //      while the blade is enabled (which already encodes "actively mowing under acceptable position
-//      accuracy" - see ticket), stamps a disc of radius tool_width/2 along the path into a map-frame
-//      occupancy grid. The grid is published for RViz.
+//      accuracy" - see ticket), stamps the swept disc of radius tool_width/2 along the path into a
+//      sparse set of covered world-cells. Instead of republishing a full grid, the node streams
+//      DELTAS (only the cells newly covered since the last tick) on coverage_feedback/coverage_delta,
+//      so transport cost is O(robot movement), never O(lawn). A snapshot service hands a new client
+//      the full covered set on demand. See docs/map-layers-architecture.md.
 //
 //   B. Gap detect + refill (on demand, via the GetFillPaths service). Rasterizes the area polygon
 //      minus its obstacles, erodes it by erosion_margin (so the outline/keepout rim is excluded),
-//      subtracts the covered grid, declutters the difference (morphological opening + connected
-//      components with min width/area thresholds), and for each surviving gap builds a polygon and
-//      requests a linear fill from slic3r along the gap's major axis (PCA). The aggregated fill paths
-//      are returned so MowingBehavior can run them before docking.
+//      subtracts the covered cells (read out of the sparse set into a local window), declutters the
+//      difference (morphological opening + connected components with min width/area thresholds), and
+//      for each surviving gap builds a polygon and requests a linear fill from slic3r along the gap's
+//      major axis (PCA). The aggregated fill paths are returned so MowingBehavior can run them before
+//      docking.
 
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/Point32.h>
 #include <geometry_msgs/Polygon.h>
 #include <mower_msgs/HighLevelStatus.h>
 #include <mower_msgs/Status.h>
-#include <nav_msgs/OccupancyGrid.h>
 #include <nav_msgs/Path.h>
 #include <ros/ros.h>
 #include <slic3r_coverage_planner/PlanPath.h>
 #include <std_msgs/Header.h>
 #include <std_msgs/String.h>
+#include <std_srvs/Trigger.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <xbot_msgs/AbsolutePose.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <system_error>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "coverage_feedback/CoverageStatus.h"
@@ -63,8 +71,30 @@ namespace {
 
 using json = nlohmann::ordered_json;
 
-// Marker values for the single-channel coverage grid (CV_8UC1).
+// Marker value used while rasterizing the gap-detect window (CV_8UC1).
 constexpr unsigned char CELL_COVERED = 255;
+
+// Sparse-tile wire contract (must match the app exactly, see docs/map-layers-architecture.md):
+//   cell world-index  cwx = floor(x/res), cwy = floor(y/res)
+//   tile (128 cells)  tx = floordiv(cwx,128), ty = floordiv(cwy,128)
+//   local index       idx = (cwy - ty*128)*128 + (cwx - tx*128)   in [0, 128*128)
+constexpr int TILE = 128;
+
+// Pack a world-cell (cwx, cwy) into a single 64-bit key: high 32 bits = cwx, low 32 bits = cwy.
+// The two ranges are disjoint, so the map is a bijection and the inverse is exact.
+inline int64_t cellKey(int cwx, int cwy) {
+  return (static_cast<int64_t>(cwx) << 32) ^ static_cast<int64_t>(static_cast<uint32_t>(cwy));
+}
+inline void cellUnpack(int64_t key, int& cwx, int& cwy) {
+  cwx = static_cast<int32_t>(key >> 32);
+  cwy = static_cast<int32_t>(static_cast<uint32_t>(key & 0xFFFFFFFFu));
+}
+// Floored integer division (cwx may be negative); b is the positive tile size.
+inline int floorDiv(int a, int b) {
+  int q = a / b, r = a % b;
+  if (r != 0 && (r < 0) != (b < 0)) --q;
+  return q;
+}
 
 class CoverageFeedback {
  public:
@@ -82,7 +112,7 @@ class CoverageFeedback {
     private_nh.param<std::string>("pose_topic", pose_topic_, "/xbot_positioning/xb_pose");
     private_nh.param<std::string>("status_topic", status_topic_, "/ll/mower_status");
     private_nh.param<std::string>("state_topic", state_topic_, "/mower_logic/current_state");
-    private_nh.param("publish_grid", publish_grid_, true);
+    private_nh.param("publish_delta", publish_delta_, true);
 
     plan_client_ = nh.serviceClient<slic3r_coverage_planner::PlanPath>("slic3r_coverage_planner/plan_path");
 
@@ -95,10 +125,11 @@ class CoverageFeedback {
     planned_path_sub_ = nh.subscribe("mower_logic/planned_path", 1, &CoverageFeedback::onPlannedPath, this);
     fill_service_ = private_nh.advertiseService("get_fill_paths", &CoverageFeedback::onGetFillPaths, this);
 
-    if (publish_grid_) {
-      grid_pub_ = private_nh.advertise<nav_msgs::OccupancyGrid>("coverage_grid", 1, true);
-      grid_timer_ = nh.createTimer(ros::Duration(1.0), &CoverageFeedback::publishGrid, this);
-    }
+    // Live coverage as deltas (newly-covered cells only) on a 1 Hz timer, plus a snapshot service that
+    // hands a new client the full covered set. The timer also drives throttled disk persistence.
+    delta_pub_ = private_nh.advertise<std_msgs::String>("coverage_delta", 4, false);
+    snapshot_srv_ = private_nh.advertiseService("GetCoverageSnapshot", &CoverageFeedback::onGetSnapshot, this);
+    delta_timer_ = nh.createTimer(ros::Duration(1.0), &CoverageFeedback::publishDelta, this);
 
     // Telemetry (latched so `rosbag record -a` always captures the latest state).
     status_pub_ = private_nh.advertise<coverage_feedback::CoverageStatus>("status", 1, true);
@@ -133,7 +164,7 @@ class CoverageFeedback {
     const bool left_autonomous = prev_state_ == mower_msgs::HighLevelStatus::HIGH_LEVEL_STATE_AUTONOMOUS &&
                                  msg->state != mower_msgs::HighLevelStatus::HIGH_LEVEL_STATE_AUTONOMOUS;
     prev_state_ = msg->state;
-    if (left_autonomous && initialized_ && !last_job_id_.empty()) {
+    if (left_autonomous && !covered_.empty() && !last_job_id_.empty()) {
       ROS_INFO_STREAM("coverage_feedback: job '" << last_job_id_ << "' ended - persisting final coverage (pass "
                                                  << pass_index_ << ").");
       persistPass({}, {}, finalStatus());
@@ -141,8 +172,8 @@ class CoverageFeedback {
     // A new, non-empty job id means we switched jobs. Because this node has respawn=true, a crash or
     // charge-reboot mid-mow restarts it with empty in-RAM state; on the next state message it sees the
     // current (unchanged) job id as "new" and would wipe coverage that was already cut. To stay correct
-    // we persist the grid to disk per job and, on a job-id change, prefer resuming from disk over reset.
-    // Resuming the same job after a dock keeps the same id, so nothing changes there either.
+    // we persist the covered set to disk per job and, on a job-id change, prefer resuming from disk over
+    // reset. Resuming the same job after a dock keeps the same id, so nothing changes there either.
     if (!msg->job_id.empty() && msg->job_id != last_job_id_) {
       last_job_id_ = msg->job_id;
       // The per-pass track buffer and the cached pass-0 plan belong to the previous job: drop them so
@@ -150,22 +181,25 @@ class CoverageFeedback {
       track_.clear();
       planned_path_plan_ = json::object();
       have_planned_path_ = false;
+      resetCoverage();
+      // Tell the app to drop the previous job's overlay immediately; a resumed job then re-fetches its
+      // covered set via the snapshot service, so the cleared overlay is repopulated right away.
+      publishReset();
       if (loadLatest(msg->job_id)) {
         ROS_INFO_STREAM("coverage_feedback: resuming job '" << msg->job_id << "' from disk (pass " << pass_index_
-                                                            << ", grid " << grid_.cols << "x" << grid_.rows << ").");
+                                                            << ", " << covered_.size() << " covered cells).");
       } else {
-        ROS_INFO_STREAM("coverage_feedback: new job '" << msg->job_id << "' - starting fresh coverage grid.");
-        resetGrid();
-        publishEmptyGrid();  // clear the app's retained overlay so the previous job's coverage doesn't linger
+        ROS_INFO_STREAM("coverage_feedback: new job '" << msg->job_id << "' - starting fresh coverage.");
       }
       return;
     }
     last_job_id_ = msg->job_id;
   }
 
-  void resetGrid() {
-    grid_.release();
-    initialized_ = false;
+  // Drop all live coverage state (new job / explicit reset). Persistence on disk is untouched.
+  void resetCoverage() {
+    covered_.clear();
+    delta_keys_.clear();
     have_prev_ = false;
     pass_index_ = 0;
   }
@@ -197,100 +231,129 @@ class CoverageFeedback {
     stamp(x, y);
   }
 
-  // Ensure the grid contains world point (x, y) with a margin of slack, growing the cv::Mat and
-  // shifting the origin if needed. Row index increases with +y so the Mat maps 1:1 onto a ROS
-  // OccupancyGrid (data row-major from the origin corner, +x then +y).
-  void ensureContains(double x, double y) {
-    constexpr int kMargin = 32;  // cells of slack kept on every side to amortise reallocations
-    if (!initialized_) {
-      origin_x_ = x - kMargin * res_;
-      origin_y_ = y - kMargin * res_;
-      grid_ = cv::Mat::zeros(2 * kMargin + 1, 2 * kMargin + 1, CV_8UC1);
-      initialized_ = true;
-    }
-
-    int c = static_cast<int>(std::round((x - origin_x_) / res_));
-    int r = static_cast<int>(std::round((y - origin_y_) / res_));
-
-    int add_left = c < kMargin ? kMargin - c : 0;
-    int add_right = c >= grid_.cols - kMargin ? c - (grid_.cols - kMargin) + 1 : 0;
-    int add_bottom = r < kMargin ? kMargin - r : 0;
-    int add_top = r >= grid_.rows - kMargin ? r - (grid_.rows - kMargin) + 1 : 0;
-
-    if (add_left || add_right || add_bottom || add_top) {
-      cv::Mat bigger = cv::Mat::zeros(grid_.rows + add_bottom + add_top, grid_.cols + add_left + add_right, CV_8UC1);
-      grid_.copyTo(bigger(cv::Rect(add_left, add_bottom, grid_.cols, grid_.rows)));
-      grid_ = bigger;
-      origin_x_ -= add_left * res_;
-      origin_y_ -= add_bottom * res_;
-    }
-  }
-
-  cv::Point toCell(double x, double y) const {
-    return cv::Point(static_cast<int>(std::round((x - origin_x_) / res_)),
-                     static_cast<int>(std::round((y - origin_y_) / res_)));
-  }
-
-  // Stamp the swath at (x, y): a disc of radius tool_width/2, plus a thick segment back to the
-  // previous sample so a sparse pose stream still paints a continuous strip.
+  // Stamp the swept swath ending at (x, y): the capsule from the previous sample to here with radius
+  // tool_width/2. We step along the segment at ~res spacing and rasterize the disc at each step, so a
+  // sparse pose stream still paints a continuous strip. Every cell newly added to covered_ is also
+  // pushed to delta_keys_ so the next 1 Hz tick streams it.
   void stamp(double x, double y) {
-    ensureContains(x, y);
-    const int radius = std::max(1, static_cast<int>(std::round((tool_width_ / 2.0) / res_)));
-    const cv::Point p = toCell(x, y);
-    cv::circle(grid_, p, radius, cv::Scalar(CELL_COVERED), cv::FILLED);
+    const double radius = tool_width_ / 2.0;
+    double sx = x, sy = y;  // segment start (defaults to a point stamp at the current pose)
     if (have_prev_ && std::hypot(x - prev_x_, y - prev_y_) <= max_connect_gap_) {
-      cv::line(grid_, toCell(prev_x_, prev_y_), p, cv::Scalar(CELL_COVERED), 2 * radius);
+      sx = prev_x_;
+      sy = prev_y_;
+    }
+    const double seg_len = std::hypot(x - sx, y - sy);
+    const int steps = std::max(1, static_cast<int>(std::ceil(seg_len / res_)) + 1);
+    for (int s = 0; s < steps; ++s) {
+      const double t = steps > 1 ? static_cast<double>(s) / (steps - 1) : 0.0;
+      stampDisc(sx + (x - sx) * t, sy + (y - sy) * t, radius);
     }
     prev_x_ = x;
     prev_y_ = y;
     have_prev_ = true;
-    grid_dirty_ = true;
   }
 
-  // Publish a zero-size grid so the MQTT bridge clears the retained coverage layer: on a new job the
-  // app drops the previous job's overlay immediately, instead of showing it until new cells are stamped.
-  void publishEmptyGrid() {
-    nav_msgs::OccupancyGrid msg;
-    msg.header.stamp = ros::Time::now();
-    msg.header.frame_id = map_frame_;
-    msg.info.resolution = res_;
-    msg.info.width = 0;
-    msg.info.height = 0;
-    msg.info.origin.orientation.w = 1.0;
-    grid_pub_.publish(msg);
-  }
-
-  void publishGrid(const ros::TimerEvent&) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!initialized_) return;
-    if (!grid_dirty_) return;
-    nav_msgs::OccupancyGrid msg;
-    msg.header.stamp = ros::Time::now();
-    msg.header.frame_id = map_frame_;
-    msg.info.resolution = res_;
-    msg.info.width = grid_.cols;
-    msg.info.height = grid_.rows;
-    // OccupancyGrid origin is the real-world pose of the (0,0) cell corner; our origin_ is the cell centre.
-    msg.info.origin.position.x = origin_x_ - res_ / 2.0;
-    msg.info.origin.position.y = origin_y_ - res_ / 2.0;
-    msg.info.origin.orientation.w = 1.0;
-    msg.data.resize(static_cast<size_t>(grid_.cols) * grid_.rows);
-    for (int r = 0; r < grid_.rows; ++r) {
-      const unsigned char* row = grid_.ptr<unsigned char>(r);
-      for (int c = 0; c < grid_.cols; ++c) {
-        msg.data[static_cast<size_t>(r) * grid_.cols + c] = row[c] ? 100 : 0;
+  // Rasterize the disc of the given radius centred at world (cx, cy) into covered_, recording newly
+  // covered cells in delta_keys_. A cell is covered when its centre lies within radius of (cx, cy);
+  // the centre cell is always included so a sub-cell tool radius still leaves a mark.
+  void stampDisc(double cx, double cy, double radius) {
+    const int ccx = static_cast<int>(std::floor(cx / res_));
+    const int ccy = static_cast<int>(std::floor(cy / res_));
+    const int rcells = std::max(0, static_cast<int>(std::ceil(radius / res_)));
+    const double r2 = radius * radius;
+    for (int dy = -rcells; dy <= rcells; ++dy) {
+      for (int dx = -rcells; dx <= rcells; ++dx) {
+        const int cwx = ccx + dx;
+        const int cwy = ccy + dy;
+        const double wx = (cwx + 0.5) * res_;  // cell centre in world coords
+        const double wy = (cwy + 0.5) * res_;
+        if ((dx != 0 || dy != 0) && (wx - cx) * (wx - cx) + (wy - cy) * (wy - cy) > r2) continue;
+        const int64_t key = cellKey(cwx, cwy);
+        if (covered_.insert(key).second) delta_keys_.push_back(key);
       }
     }
-    grid_pub_.publish(msg);
-    grid_dirty_ = false;
+  }
 
-    // Periodically refresh latest.yml.gz so a respawn after a crash resumes with near-current coverage
-    // even if no GetFillPaths call happened since the last save. Throttled to avoid gzip churn at 1 Hz.
+  // Group a list of world-cell keys by tile into the wire-format "tiles" array:
+  //   [ {"tx":T,"ty":T,"cells":[idx,...]}, ... ]   idx = (cwy-ty*128)*128 + (cwx-tx*128)
+  template <typename Range>
+  json tilesJson(const Range& keys) const {
+    std::map<std::pair<int, int>, std::vector<int>> by_tile;
+    for (const int64_t key : keys) {
+      int cwx, cwy;
+      cellUnpack(key, cwx, cwy);
+      const int tx = floorDiv(cwx, TILE);
+      const int ty = floorDiv(cwy, TILE);
+      const int lx = cwx - tx * TILE;
+      const int ly = cwy - ty * TILE;
+      by_tile[{tx, ty}].push_back(ly * TILE + lx);
+    }
+    json tiles = json::array();
+    for (auto& [txy, cells] : by_tile) {
+      tiles.push_back({{"tx", txy.first}, {"ty", txy.second}, {"cells", cells}});
+    }
+    return tiles;
+  }
+
+  // Full state of covered_ as one JSON string (same shape as a delta, but every covered cell and no
+  // "reset" field). Used by the snapshot service and the per-job/per-pass persistence. Hold mutex_.
+  json snapshotJson() const {
+    json j;
+    j["job_id"] = last_job_id_;
+    j["res"] = res_;
+    j["tile"] = TILE;
+    j["tiles"] = tilesJson(covered_);
+    return j;
+  }
+
+  // Wrap a JSON document in a std_msgs/String for publishing on coverage_delta.
+  static std_msgs::String toStringMsg(const json& j) {
+    std_msgs::String msg;
+    msg.data = j.dump();
+    return msg;
+  }
+
+  // Publish a one-shot reset delta so the app drops the previous job's overlay. Hold mutex_.
+  void publishReset() {
+    json j;
+    j["job_id"] = last_job_id_;
+    j["reset"] = true;
+    j["tiles"] = json::array();
+    delta_pub_.publish(toStringMsg(j));
+  }
+
+  // 1 Hz: stream the cells covered since the last tick (idle-gated: nothing new -> nothing published),
+  // then periodically refresh the on-disk snapshot so a respawn resumes with near-current coverage.
+  void publishDelta(const ros::TimerEvent&) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!delta_keys_.empty()) {
+      if (publish_delta_) {
+        json j;
+        j["job_id"] = last_job_id_;
+        j["res"] = res_;
+        j["tile"] = TILE;
+        j["reset"] = false;
+        j["tiles"] = tilesJson(delta_keys_);
+        delta_pub_.publish(toStringMsg(j));
+      }
+      delta_keys_.clear();
+    }
+
+    // Throttle disk saves to avoid churn; only meaningful once we actually have coverage.
     constexpr int kSaveEverySeconds = 10;
-    if (++save_tick_ >= kSaveEverySeconds) {
+    if (!covered_.empty() && ++save_tick_ >= kSaveEverySeconds) {
       save_tick_ = 0;
       saveLatest();
     }
+  }
+
+  // Snapshot service (std_srvs/Trigger): the full covered set as JSON in the response `message`. Using
+  // Trigger keeps this dependency-light - no custom .srv, and xbot_monitoring only needs std_srvs.
+  bool onGetSnapshot(std_srvs::Trigger::Request&, std_srvs::Trigger::Response& res) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    res.success = true;
+    res.message = snapshotJson().dump();
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -309,19 +372,31 @@ class CoverageFeedback {
     return coverageRoot() + "/" + job_id;
   }
 
-  // Serialize the live grid + georeferencing + pass counter via cv::FileStorage. Must hold mutex_.
-  static void writeGrid(cv::FileStorage& fs, const cv::Mat& grid, double origin_x, double origin_y, double res,
-                        int pass_index) {
-    fs << "grid" << grid;
-    fs << "origin_x" << origin_x;
-    fs << "origin_y" << origin_y;
-    fs << "res" << res;
-    fs << "pass_index" << pass_index;
+  // Repopulate covered_ from a snapshot JSON document ({tiles:[{tx,ty,cells:[idx,...]}]}). Returns the
+  // number of cells inserted. Tolerant of missing/garbled fields (best-effort resume).
+  size_t loadSnapshot(const json& snap) {
+    size_t added = 0;
+    if (!snap.is_object() || !snap.contains("tiles") || !snap["tiles"].is_array()) return 0;
+    for (const auto& tile : snap["tiles"]) {
+      if (!tile.is_object() || !tile.contains("tx") || !tile.contains("ty") || !tile.contains("cells")) continue;
+      const int tx = tile["tx"].get<int>();
+      const int ty = tile["ty"].get<int>();
+      for (const auto& cell : tile["cells"]) {
+        const int idx = cell.get<int>();
+        if (idx < 0 || idx >= TILE * TILE) continue;
+        const int lx = idx % TILE;
+        const int ly = idx / TILE;
+        if (covered_.insert(cellKey(tx * TILE + lx, ty * TILE + ly)).second) ++added;
+      }
+    }
+    return added;
   }
 
-  // Atomically (write-to-temp + rename) refresh <job>/latest.yml.gz from the current grid. Must hold mutex_.
+  // Atomically (write-to-temp + rename) refresh <job>/latest.json.gz from covered_. The snapshot JSON
+  // string is stored inside an OpenCV FileStorage (already a workspace dep) so it is gzipped for free.
+  // Must hold mutex_.
   void saveLatest() {
-    if (!initialized_ || last_job_id_.empty()) return;
+    if (covered_.empty() || last_job_id_.empty()) return;
     const std::string dir = jobDir(last_job_id_);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -329,18 +404,20 @@ class CoverageFeedback {
       ROS_WARN_STREAM("coverage_feedback: cannot create job dir '" << dir << "': " << ec.message());
       return;
     }
-    const std::string final_path = dir + "/latest.yml.gz";
-    const std::string tmp_path = dir + "/latest.tmp.yml.gz";  // keep .yml.gz so OpenCV gzips it
+    const std::string final_path = dir + "/latest.json.gz";
+    const std::string tmp_path = dir + "/latest.tmp.json.gz";  // keep .json.gz so OpenCV gzips it
     try {
       cv::FileStorage fs(tmp_path, cv::FileStorage::WRITE);
       if (!fs.isOpened()) {
         ROS_WARN_STREAM("coverage_feedback: cannot open '" << tmp_path << "' for writing.");
         return;
       }
-      writeGrid(fs, grid_, origin_x_, origin_y_, res_, pass_index_);
+      fs << "res" << res_;
+      fs << "pass_index" << pass_index_;
+      fs << "snapshot" << snapshotJson().dump();
       fs.release();
     } catch (const cv::Exception& e) {
-      ROS_WARN_STREAM("coverage_feedback: failed to write latest grid: " << e.what());
+      ROS_WARN_STREAM("coverage_feedback: failed to write latest snapshot: " << e.what());
       return;
     }
     std::filesystem::rename(tmp_path, final_path, ec);
@@ -349,36 +426,32 @@ class CoverageFeedback {
     }
   }
 
-  // Restore grid_ + georeferencing + pass counter from <job>/latest.yml.gz. Returns false (leaving state
-  // untouched) if there is no usable saved data. Must hold mutex_.
+  // Restore covered_ + pass counter from <job>/latest.json.gz. Returns false (leaving state untouched)
+  // if there is no usable saved data. Must hold mutex_.
   bool loadLatest(const std::string& job_id) {
-    const std::string path = jobDir(job_id) + "/latest.yml.gz";
+    const std::string path = jobDir(job_id) + "/latest.json.gz";
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || ec) return false;
     try {
       cv::FileStorage fs(path, cv::FileStorage::READ);
       if (!fs.isOpened()) return false;
-      cv::Mat g;
-      fs["grid"] >> g;
-      if (g.empty() || g.type() != CV_8UC1) {
-        ROS_WARN_STREAM("coverage_feedback: '" << path << "' has no usable grid - starting fresh.");
-        return false;
-      }
-      double ox = origin_x_, oy = origin_y_, rr = res_;
+      std::string snap_str;
+      fs["snapshot"] >> snap_str;
+      double rr = res_;
       int pass = 0;
-      fs["origin_x"] >> ox;
-      fs["origin_y"] >> oy;
       fs["res"] >> rr;
       fs["pass_index"] >> pass;
       fs.release();
-      grid_ = g;
-      origin_x_ = ox;
-      origin_y_ = oy;
-      if (rr > 0.0) res_ = rr;  // keep the grid self-consistent with the resolution it was built at
+      if (snap_str.empty()) {
+        ROS_WARN_STREAM("coverage_feedback: '" << path << "' has no usable snapshot - starting fresh.");
+        return false;
+      }
+      const json snap = json::parse(snap_str, nullptr, /*allow_exceptions=*/false);
+      if (rr > 0.0) res_ = rr;  // keep coverage self-consistent with the resolution it was built at
       pass_index_ = pass;
-      initialized_ = true;
+      const size_t n = loadSnapshot(snap);
       have_prev_ = false;
-      return true;
+      return n > 0;
     } catch (const cv::Exception& e) {
       ROS_WARN_STREAM("coverage_feedback: failed to load '" << path << "': " << e.what());
       return false;
@@ -560,45 +633,10 @@ class CoverageFeedback {
     }
   }
 
-  // Run-length encode the live grid as the app's coverage layer (the same {res, w, h, ox, oy, rle} scheme
-  // xbot_monitoring emits for map_layers/coverage/json: row-major, 100 = covered, 0 = uncovered). The app
-  // can render the pass without OpenCV. Must hold mutex_.
+  // Per-pass coverage snapshot for the history view: the same sparse-tile shape the snapshot service
+  // and live deltas use ({job_id, res, tile, tiles:[{tx,ty,cells:[idx,...]}]}). Must hold mutex_.
   json coverageJson() const {
-    json j;
-    j["res"] = res_;
-    j["w"] = grid_.cols;
-    j["h"] = grid_.rows;
-    // ox/oy are the real-world pose of the (0,0) cell corner, matching the published OccupancyGrid.
-    j["ox"] = origin_x_ - res_ / 2.0;
-    j["oy"] = origin_y_ - res_ / 2.0;
-    json rle = json::array();
-    int cur = 0;
-    uint32_t cnt = 0;
-    bool first = true;
-    for (int r = 0; r < grid_.rows; ++r) {
-      const unsigned char* row = grid_.ptr<unsigned char>(r);
-      for (int c = 0; c < grid_.cols; ++c) {
-        const int v = row[c] ? 100 : 0;
-        if (first) {
-          cur = v;
-          cnt = 1;
-          first = false;
-        } else if (v == cur) {
-          cnt++;
-        } else {
-          rle.push_back(cur);
-          rle.push_back(static_cast<int>(cnt));
-          cur = v;
-          cnt = 1;
-        }
-      }
-    }
-    if (!first) {
-      rle.push_back(cur);
-      rle.push_back(static_cast<int>(cnt));
-    }
-    j["rle"] = rle;
-    return j;
+    return snapshotJson();
   }
 
   // planned_path.json: pass 0 replays the slic3r mow plan; pass N>=1 replays this node's fill paths.
@@ -652,48 +690,32 @@ class CoverageFeedback {
     writeJsonAtomic(path, j);
   }
 
-  // Lightweight CoverageStatus for an end-of-job snapshot. The full gap analysis (and the area mask
-  // it needs) only exists inside get_fill_paths, so here we report the covered area straight from the
-  // grid and an approximate percent over the grid extent. The grid snapshot itself is exact. Hold mutex_.
+  // Lightweight CoverageStatus for an end-of-job snapshot. The full gap analysis (and the area mask it
+  // needs) only exists inside get_fill_paths; here we just report the exact covered area from the
+  // sparse set. Target/percent need the area polygon, which we don't have at job end, so they stay 0.
+  // Hold mutex_.
   coverage_feedback::CoverageStatus finalStatus() const {
     coverage_feedback::CoverageStatus s;
-    if (initialized_) {
-      const double cell_area = res_ * res_;
-      const double covered = static_cast<double>(cv::countNonZero(grid_)) * cell_area;
-      const double total = static_cast<double>(grid_.cols) * static_cast<double>(grid_.rows) * cell_area;
-      s.covered_area = covered;
-      s.target_area = total;
-      s.uncovered_area = total > covered ? total - covered : 0.0;
-      s.coverage_percent = total > 0.0 ? 100.0 * covered / total : 0.0;
-      s.gap_count = 0;
-    }
+    s.covered_area = static_cast<double>(covered_.size()) * (res_ * res_);
+    s.target_area = 0.0;
+    s.uncovered_area = 0.0;
+    s.coverage_percent = 0.0;
+    s.gap_count = 0;
     return s;
   }
 
-  // Write an immutable snapshot of the just-completed pass into <job>/pass<N>/ (grid + meta + JSON),
-  // then advance the pass counter and refresh latest.yml.gz so a resume continues at the next pass.
+  // Write an immutable snapshot of the just-completed pass into <job>/pass<N>/ (coverage + meta + JSON),
+  // then advance the pass counter and refresh latest.json.gz so a resume continues at the next pass.
   // Must hold mutex_.
   void persistPass(const std::vector<GapViz>& gaps, const std::vector<slic3r_coverage_planner::Path>& paths,
                    const coverage_feedback::CoverageStatus& status) {
-    if (!initialized_ || last_job_id_.empty()) return;
+    if (covered_.empty() || last_job_id_.empty()) return;
     const std::string dir = jobDir(last_job_id_) + "/pass" + std::to_string(pass_index_);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     if (ec) {
       ROS_WARN_STREAM("coverage_feedback: cannot create pass dir '" << dir << "': " << ec.message());
     } else {
-      try {
-        cv::FileStorage fs(dir + "/grid.yml.gz", cv::FileStorage::WRITE);
-        if (fs.isOpened()) {
-          writeGrid(fs, grid_, origin_x_, origin_y_, res_, pass_index_);
-          fs << "covered_area" << status.covered_area;
-          fs << "uncovered_area" << status.uncovered_area;
-          fs << "gap_count" << status.gap_count;
-          fs.release();
-        }
-      } catch (const cv::Exception& e) {
-        ROS_WARN_STREAM("coverage_feedback: failed to write pass grid: " << e.what());
-      }
       writeGapsJson(dir + "/gaps.json", gaps);
       writeFillPathsJson(dir + "/fill_paths.json", paths);
       // Per-pass triplet (+ meta) so every mow attempt can be visualized identically to the first.
@@ -729,7 +751,7 @@ class CoverageFeedback {
 
     const double tool_width = req.tool_width > 0.0 ? req.tool_width : tool_width_;
 
-    if (!initialized_) {
+    if (covered_.empty()) {
       ROS_WARN_STREAM("coverage_feedback: no coverage accumulated yet - cannot assess gaps, skipping refill.");
       clearGaps(hdr);
       emitStatus(false);
@@ -742,7 +764,8 @@ class CoverageFeedback {
       return true;
     }
 
-    // --- window aligned to the global grid so the covered region copies by integer offset ---
+    // --- window aligned to the global world-cell grid (cwx = floor(x/res)) so the covered set maps in
+    //     by integer offset; the window's bottom-left cell is (cwx0, cwy0) ---
     double min_x = req.area.area.points.front().x, max_x = min_x;
     double min_y = req.area.area.points.front().y, max_y = min_y;
     for (const auto& pt : req.area.area.points) {
@@ -757,12 +780,12 @@ class CoverageFeedback {
     max_x += pad;
     max_y += pad;
 
-    const int c0 = static_cast<int>(std::floor((min_x - origin_x_) / res_));
-    const int r0 = static_cast<int>(std::floor((min_y - origin_y_) / res_));
-    const double win_origin_x = origin_x_ + c0 * res_;
-    const double win_origin_y = origin_y_ + r0 * res_;
-    const int cols = static_cast<int>(std::ceil((max_x - win_origin_x) / res_)) + 1;
-    const int rows = static_cast<int>(std::ceil((max_y - win_origin_y) / res_)) + 1;
+    const int cwx0 = static_cast<int>(std::floor(min_x / res_));
+    const int cwy0 = static_cast<int>(std::floor(min_y / res_));
+    const int cwx1 = static_cast<int>(std::floor(max_x / res_));
+    const int cwy1 = static_cast<int>(std::floor(max_y / res_));
+    const int cols = cwx1 - cwx0 + 1;
+    const int rows = cwy1 - cwy0 + 1;
     if (cols <= 0 || rows <= 0 || static_cast<long>(cols) * rows > 50'000'000L) {
       ROS_WARN_STREAM("coverage_feedback: unreasonable gap window " << cols << "x" << rows << ", skipping refill.");
       clearGaps(hdr);
@@ -770,9 +793,11 @@ class CoverageFeedback {
       return true;
     }
 
+    // Window column/row -> world-cell index: c = floor(x/res) - cwx0. Cell (c,r) covers world cell
+    // (cwx0+c, cwy0+r); its centre in world coords is ((cwx0+c)+0.5)*res, ((cwy0+r)+0.5)*res.
     auto worldToWin = [&](double x, double y) {
-      return cv::Point(static_cast<int>(std::round((x - win_origin_x) / res_)),
-                       static_cast<int>(std::round((y - win_origin_y) / res_)));
+      return cv::Point(static_cast<int>(std::floor(x / res_)) - cwx0,
+                       static_cast<int>(std::floor(y / res_)) - cwy0);
     };
 
     // --- target = area minus obstacles, eroded by erosion_margin ---
@@ -785,13 +810,14 @@ class CoverageFeedback {
     cv::erode(target, target,
               cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * erode_px + 1, 2 * erode_px + 1)));
 
-    // --- covered window, copied from the global grid by integer offset ---
+    // --- covered window: stamp the cells of covered_ that fall inside the window (O(covered_)) ---
     cv::Mat covered = cv::Mat::zeros(rows, cols, CV_8UC1);
-    const cv::Rect global_rect(0, 0, grid_.cols, grid_.rows);
-    const cv::Rect want_rect(c0, r0, cols, rows);
-    const cv::Rect inter = global_rect & want_rect;
-    if (inter.area() > 0) {
-      grid_(inter).copyTo(covered(cv::Rect(inter.x - c0, inter.y - r0, inter.width, inter.height)));
+    for (const int64_t key : covered_) {
+      int cwx, cwy;
+      cellUnpack(key, cwx, cwy);
+      const int c = cwx - cwx0;
+      const int r = cwy - cwy0;
+      if (c >= 0 && c < cols && r >= 0 && r < rows) covered.at<unsigned char>(r, c) = CELL_COVERED;
     }
 
     // Coverage stats over the eroded target (telemetry).
@@ -863,8 +889,8 @@ class CoverageFeedback {
       poly.points.reserve(contour.size());
       for (const auto& cp : contour) {
         geometry_msgs::Point32 wp;
-        wp.x = static_cast<float>(win_origin_x + cp.x * res_);
-        wp.y = static_cast<float>(win_origin_y + cp.y * res_);
+        wp.x = static_cast<float>((cwx0 + cp.x + 0.5) * res_);
+        wp.y = static_cast<float>((cwy0 + cp.y + 0.5) * res_);
         wp.z = 0.0f;
         poly.points.push_back(wp);
       }
@@ -873,8 +899,8 @@ class CoverageFeedback {
       gv.polygon = poly;
       gv.angle = angle;
       gv.area_m2 = stats.at<int>(label, cv::CC_STAT_AREA) * (res_ * res_);
-      gv.cx = win_origin_x + centroids.at<double>(label, 0) * res_;
-      gv.cy = win_origin_y + centroids.at<double>(label, 1) * res_;
+      gv.cx = (cwx0 + centroids.at<double>(label, 0) + 0.5) * res_;
+      gv.cy = (cwy0 + centroids.at<double>(label, 1) + 0.5) * res_;
       gap_viz.push_back(gv);
 
       slic3r_coverage_planner::PlanPath plan;
@@ -943,12 +969,13 @@ class CoverageFeedback {
   ros::Subscriber state_sub_;
   ros::Subscriber planned_path_sub_;
   ros::ServiceServer fill_service_;
+  ros::ServiceServer snapshot_srv_;
   ros::ServiceClient plan_client_;
-  ros::Publisher grid_pub_;
+  ros::Publisher delta_pub_;
   ros::Publisher status_pub_;
   ros::Publisher gaps_pub_;
   ros::Publisher fill_paths_pub_;
-  ros::Timer grid_timer_;
+  ros::Timer delta_timer_;
 
   // --- params ---
   double res_ = 0.05;
@@ -958,24 +985,22 @@ class CoverageFeedback {
   double residual_stop_area_ = 0.05;
   double erosion_margin_ = 0.07;
   double max_connect_gap_ = 0.5;
-  bool publish_grid_ = true;
+  bool publish_delta_ = true;
   std::string map_frame_ = "map";
   std::string pose_topic_;
   std::string status_topic_;
   std::string state_topic_;
 
-  // --- coverage grid state (map frame; cell (0,0) centre at origin_) ---
+  // --- coverage state: sparse set of covered world-cells (cwx = floor(x/res), cwy = floor(y/res)),
+  //     keyed by cellKey(cwx, cwy). delta_keys_ collects cells newly covered since the last 1 Hz tick. ---
   std::mutex mutex_;
-  cv::Mat grid_;
-  bool initialized_ = false;
-  bool grid_dirty_ = false;
-  double origin_x_ = 0.0;
-  double origin_y_ = 0.0;
+  std::unordered_set<int64_t> covered_;
+  std::vector<int64_t> delta_keys_;
   double kMaxJump_ = 2.0;  // metres; reject EKF/GPS teleports
 
   // --- disk persistence ---
   int pass_index_ = 0;      // per-job pass counter (pass<N> snapshot dir); restored on resume
-  int save_tick_ = 0;       // publishGrid timer ticks since the last periodic saveLatest()
+  int save_tick_ = 0;       // delta-timer ticks since the last periodic saveLatest()
   uint8_t prev_state_ = 0;  // last HighLevelStatus.state (NULL); detects AUTONOMOUS->IDLE = job end
 
   bool mowing_active_ = false;
@@ -984,7 +1009,7 @@ class CoverageFeedback {
   double prev_y_ = 0.0;
   std::string last_job_id_;
 
-  // --- per-pass replay capture (written into pass<N>/ alongside the grid) ---
+  // --- per-pass replay capture (written into pass<N>/ alongside the coverage snapshot) ---
   struct TrackPoint {
     double x;
     double y;

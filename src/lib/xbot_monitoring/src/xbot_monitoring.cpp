@@ -20,9 +20,9 @@
 #include "PositionHistory.h"
 #include "capabilities.h"
 #include "geometry_msgs/Twist.h"
-#include "nav_msgs/OccupancyGrid.h"
 #include "ros/ros.h"
 #include "std_msgs/String.h"
+#include "std_srvs/Trigger.h"
 #include "xbot_mqtt/RegisterMethodsSrv.h"
 #include "xbot_mqtt/RpcError.h"
 #include "xbot_mqtt/RpcRequest.h"
@@ -48,7 +48,6 @@ void publish_capabilities();
 void publish_sensor_metadata();
 void publish_map();
 void publish_map_overlay();
-void publish_coverage();
 void publish_planned_path();
 void publish_actions();
 void publish_version();
@@ -95,7 +94,6 @@ class MqttCallback : public mqtt::callback {
         publish_sensor_metadata();
         publish_map();
         publish_map_overlay();
-        publish_coverage();
         publish_planned_path();
         publish_actions();
         publish_version();
@@ -159,11 +157,8 @@ json map;
 std::mutex map_mutex;
 json map_overlay;
 std::mutex map_overlay_mutex;
-json coverage_layer;
-std::mutex coverage_mutex;
 bool has_map = false;
 bool has_map_overlay = false;
-bool has_coverage = false;
 
 EventHistory event_history;
 PositionHistory position_history;
@@ -358,6 +353,17 @@ xbot_mqtt::RpcProvider rpc_provider("xbot_monitoring", {{
         } else {
             return planned_path_history.deleteHistory(std::nullopt);
         }
+    }),
+    RPC_METHOD("coverage.snapshot", {
+        // Full live coverage state for a freshly-connected client: call the coverage_feedback snapshot
+        // service (std_srvs/Trigger carrying the JSON in `message`) and hand the parsed object back.
+        // The client then applies this and follows map_layers/coverage/delta for incremental updates.
+        ros::ServiceClient client = n->serviceClient<std_srvs::Trigger>("coverage_feedback/GetCoverageSnapshot");
+        std_srvs::Trigger srv;
+        if (!client.call(srv) || !srv.response.success) {
+            return json::object();
+        }
+        return json::parse(srv.response.message, nullptr, /*allow_exceptions=*/false);
     }),
     RPC_METHOD("coverage.history.list", {
         return list_coverage_histories();
@@ -851,30 +857,6 @@ void publish_map_overlay() {
     try_publish_binary("map_overlay/bson", bson.data(), bson.size(), true);
 }
 
-// Bridges the coverage_feedback OccupancyGrid (covered/not-covered cells in the map frame) to the
-// app. The grid is run-length encoded (cells are mostly long runs of the same value), so even a
-// large lawn stays small enough to stream at the grid's ~1 Hz update rate.
-void publish_coverage() {
-    json m;
-    {
-        std::lock_guard<std::mutex> lk(coverage_mutex);
-        if (!has_coverage) {
-            // No live coverage yet (fresh start / between jobs): clear any retained coverage so a
-            // stale grid from a previous job or sim run can't linger on the broker for new clients.
-            // The robot's own resume is disk-based and unaffected by this.
-            try_publish("map_layers/coverage/json", "", true);
-            try_publish_binary("map_layers/coverage/bson", "", 0, true);
-            return;
-        }
-        m = coverage_layer;
-    }
-    try_publish("map_layers/coverage/json", m.dump(), true);
-    json data;
-    data["d"] = m;
-    auto bson = json::to_bson(data);
-    try_publish_binary("map_layers/coverage/bson", bson.data(), bson.size(), true);
-}
-
 // Bridges only the CURRENT area's slic3r plan to the app as JSON (not the whole accumulated job), so
 // the retained MQTT payload stays bounded regardless of lawn size. The whole job is reachable one
 // area at a time via the planned_path.history / .step RPCs.
@@ -890,43 +872,12 @@ void publish_planned_path() {
     try_publish("map_layers/planned_path/json", planned_path_history.getCurrentArea().dump(), true);
 }
 
-void coverage_callback(const nav_msgs::OccupancyGrid::ConstPtr &msg) {
-    json j;
-    j["res"] = msg->info.resolution;
-    j["w"] = msg->info.width;
-    j["h"] = msg->info.height;
-    j["ox"] = msg->info.origin.position.x;
-    j["oy"] = msg->info.origin.position.y;
-    j["stamp"] = msg->header.stamp.toSec();
-    // Run-length encode the row-major int8 data (values: 100 covered, 0 in-area-uncovered, -1 unknown)
-    // as a flat [value, count, value, count, ...] array.
-    json rle = json::array();
-    const auto &d = msg->data;
-    if (!d.empty()) {
-        int8_t cur = d[0];
-        uint32_t cnt = 1;
-        for (size_t i = 1; i < d.size(); i++) {
-            if (d[i] == cur) {
-                cnt++;
-            } else {
-                rle.push_back((int)cur);
-                rle.push_back((int)cnt);
-                cur = d[i];
-                cnt = 1;
-            }
-        }
-        rle.push_back((int)cur);
-        rle.push_back((int)cnt);
-    }
-    j["rle"] = rle;
-    {
-        std::lock_guard<std::mutex> lk(coverage_mutex);
-        coverage_layer = j;
-        // A zero-size grid (published by coverage_feedback on a new job) means "no coverage": treat it
-        // as empty so publish_coverage clears the retained layer instead of streaming a stale grid.
-        has_coverage = msg->info.width > 0 && msg->info.height > 0;
-    }
-    publish_coverage();
+// Bridges the coverage_feedback sparse-tile coverage delta (a JSON string of cells newly covered in
+// the last second, or a one-shot reset on a job change) straight through to the app on a non-retained
+// MQTT topic, like the planned_path bridge. The app applies deltas onto the snapshot it fetched via the
+// coverage.snapshot RPC; nothing is retained on the broker (the full state lives behind the snapshot).
+void coverage_delta_callback(const std_msgs::String::ConstPtr &msg) {
+    try_publish("map_layers/coverage/delta", msg->data, false);
 }
 
 void map_callback(const std_msgs::String::ConstPtr &msg) {
@@ -1128,7 +1079,7 @@ int main(int argc, char **argv) {
     ros::Subscriber robotStateSubscriber = n->subscribe("xbot_monitoring/robot_state", 10, robot_state_callback);
     ros::Subscriber mapSubscriber = n->subscribe("mower_map_service/json_map", 10, map_callback);
     ros::Subscriber mapOverlaySubscriber = n->subscribe("xbot_monitoring/map_overlay", 10, map_overlay_callback);
-    ros::Subscriber coverageSubscriber = n->subscribe("coverage_feedback/coverage_grid", 1, coverage_callback);
+    ros::Subscriber coverageSubscriber = n->subscribe("coverage_feedback/coverage_delta", 8, coverage_delta_callback);
     ros::Subscriber plannedPathSubscriber = n->subscribe("mower_logic/planned_path", 10, planned_path_callback);
     ros::Subscriber poseSubscriber = n->subscribe("/xbot_positioning/xb_pose", 10, pose_callback);
     ros::Timer posePublishTimer = n->createTimer(ros::Duration(MQTT_POSITION_PUBLISH_INTERVAL), pose_publish_timer_callback);

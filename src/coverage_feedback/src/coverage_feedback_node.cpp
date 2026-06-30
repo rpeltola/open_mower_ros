@@ -175,6 +175,9 @@ class CoverageFeedback {
     try {
       planned_path_plan_ = json::parse(msg->data);
       have_planned_path_ = true;
+      // Pre-size the grid to the whole plan up front so per-pose stamping never has to re-anchor the
+      // origin mid-mow (which makes the app's coverage overlay twitch). One growth instead of many.
+      preallocateForPlan(planned_path_plan_);
     } catch (const json::exception& e) {
       ROS_WARN_STREAM("coverage_feedback: ignoring malformed planned_path: " << e.what());
     }
@@ -221,6 +224,32 @@ class CoverageFeedback {
       origin_x_ -= add_left * res_;
       origin_y_ -= add_bottom * res_;
     }
+  }
+
+  // Expand the grid once to cover the slic3r plan (plus turn/overshoot headroom), so subsequent
+  // per-pose stamping stays inside the allocated extent and the published origin stays put — without
+  // this the grid re-anchors its origin pose-by-pose and the app's coverage overlay twitches.
+  void preallocateForPlan(const json& plan) {
+    if (!plan.contains("paths") || !plan["paths"].is_array()) return;
+    double min_x = 1e9, min_y = 1e9, max_x = -1e9, max_y = -1e9;
+    bool any = false;
+    for (const auto& path : plan["paths"]) {
+      if (!path.contains("points") || !path["points"].is_array()) continue;
+      for (const auto& pt : path["points"]) {
+        if (!pt.is_array() || pt.size() < 2) continue;
+        const double px = pt[0].get<double>(), py = pt[1].get<double>();
+        min_x = std::min(min_x, px);
+        max_x = std::max(max_x, px);
+        min_y = std::min(min_y, py);
+        max_y = std::max(max_y, py);
+        any = true;
+      }
+    }
+    if (!any) return;
+    // Pad beyond the plan so EKF overshoot at lane-end turns stays inside the allocated grid.
+    constexpr double kPlanPad = 2.0;  // metres (on top of ensureContains' own kMargin slack)
+    ensureContains(min_x - kPlanPad, min_y - kPlanPad);
+    ensureContains(max_x + kPlanPad, max_y + kPlanPad);
   }
 
   cv::Point toCell(double x, double y) const {

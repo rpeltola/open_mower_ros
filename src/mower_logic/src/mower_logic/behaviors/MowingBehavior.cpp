@@ -235,6 +235,7 @@ bool MowingBehavior::create_mowing_plan(int area_index) {
   {
     json planned;
     planned["job_id"] = current_job_id;
+    planned["area_id"] = currentMowingAreaId;
     planned["paths"] = json::array();
     for (const auto& path : currentMowingPaths) {
       json path_json;

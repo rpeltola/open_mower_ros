@@ -156,6 +156,7 @@ class CoverageFeedback {
       } else {
         ROS_INFO_STREAM("coverage_feedback: new job '" << msg->job_id << "' - starting fresh coverage grid.");
         resetGrid();
+        publishEmptyGrid();  // clear the app's retained overlay so the previous job's coverage doesn't linger
       }
       return;
     }
@@ -270,6 +271,19 @@ class CoverageFeedback {
     prev_x_ = x;
     prev_y_ = y;
     have_prev_ = true;
+  }
+
+  // Publish a zero-size grid so the MQTT bridge clears the retained coverage layer: on a new job the
+  // app drops the previous job's overlay immediately, instead of showing it until new cells are stamped.
+  void publishEmptyGrid() {
+    nav_msgs::OccupancyGrid msg;
+    msg.header.stamp = ros::Time::now();
+    msg.header.frame_id = map_frame_;
+    msg.info.resolution = res_;
+    msg.info.width = 0;
+    msg.info.height = 0;
+    msg.info.origin.orientation.w = 1.0;
+    grid_pub_.publish(msg);
   }
 
   void publishGrid(const ros::TimerEvent&) {

@@ -914,7 +914,9 @@ void coverage_callback(const nav_msgs::OccupancyGrid::ConstPtr &msg) {
     {
         std::lock_guard<std::mutex> lk(coverage_mutex);
         coverage_layer = j;
-        has_coverage = true;
+        // A zero-size grid (published by coverage_feedback on a new job) means "no coverage": treat it
+        // as empty so publish_coverage clears the retained layer instead of streaming a stale grid.
+        has_coverage = msg->info.width > 0 && msg->info.height > 0;
     }
     publish_coverage();
 }

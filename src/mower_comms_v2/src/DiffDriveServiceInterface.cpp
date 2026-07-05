@@ -7,25 +7,53 @@
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/TwistStamped.h>
 
-bool DiffDriveServiceInterface::OnConfigurationRequested(uint16_t service_id) {
+void DiffDriveServiceInterface::WriteConfiguration() {
+  // A configuration transaction must contain ALL required registers, or the firmware
+  // rejects it ("did not contain all required registers"). So always write the full set.
   StartTransaction(true);
   SetRegisterWheelDistance(wheel_distance_);
   SetRegisterWheelTicksPerMeter(ticks_per_meter_);
-  // 0 = open-loop duty (default), 1 = closed-loop speed (ESC closes the loop).
-  SetRegisterControlMode(speed_control_ ? 1 : 0);
+  // 0 = duty (default), 1 = duty_loop (firmware PI on measured wheel speed -> duty).
+  SetRegisterControlMode(control_mode_);
+  // Speed-loop overrides (<0 for Kp/Ki, <=0 for max/slew => firmware built-in per-mode value).
+  SetRegisterLoopKp(loop_kp_);
+  SetRegisterLoopKi(loop_ki_);
+  SetRegisterLoopMaxOutput(loop_max_);
+  SetRegisterLoopSlew(loop_slew_);
   CommitTransaction();
+}
+
+bool DiffDriveServiceInterface::OnConfigurationRequested(uint16_t service_id) {
+  WriteConfiguration();
   return true;
 }
 
+void DiffDriveServiceInterface::ApplyConfiguration(uint8_t mode, float loop_kp, float loop_ki, float loop_max,
+                                                   float loop_slew) {
+  control_mode_ = mode;
+  loop_kp_ = loop_kp;
+  loop_ki_ = loop_ki;
+  loop_max_ = loop_max;
+  loop_slew_ = loop_slew;
+  // Re-send the full configuration; the firmware reads these registers live.
+  WriteConfiguration();
+}
+
 void DiffDriveServiceInterface::SendTwist(const geometry_msgs::TwistConstPtr& msg) {
-  // Convert from ROS and publish
+  // TRANSLATION LAYER. The high-level stack (FTC planner, joystick) still emits the legacy
+  // normalized/duty-equivalent twist, but the firmware now expects PHYSICAL units:
+  // linear.x [m/s], angular.z [rad/s]. Scale here so a full-scale command maps to the real
+  // max speed, reproducing the pre-physical firmware exactly (default 0.5 m/s and 0.5 rad/s
+  // = the old kMaxWheelSpeedMps). This is the single seam between the normalized ROS stack
+  // and the physical firmware; when the stack is migrated to emit real m/s, set the scales
+  // to 1.0 and this becomes a no-op.
   double data[6]{};
-  data[0] = msg->linear.x;
+  data[0] = msg->linear.x * max_linear_speed_;
   data[1] = msg->linear.y;
   data[2] = msg->linear.z;
   data[3] = msg->angular.x;
   data[4] = msg->angular.y;
-  data[5] = msg->angular.z;
+  data[5] = msg->angular.z * max_angular_speed_;
   SendControlTwist(data, 6);
 }
 

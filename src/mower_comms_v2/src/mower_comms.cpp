@@ -74,6 +74,77 @@ void velReceived(const geometry_msgs::Twist::ConstPtr& msg) {
   diff_drive_service->SendTwist(msg);
 }
 
+// Map a control_mode string to the firmware Control Mode register value.
+// Returns false if the string is not a known mode.
+bool controlModeFromString(const std::string& s, uint8_t& mode) {
+  if (s == "duty") {
+    mode = 0;
+  } else if (s == "duty_loop") {
+    mode = 1;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+// Read a numeric rosparam as float, accepting either an int or a double on the server
+// (rosparam set from the CLI stores whole numbers as int).
+bool getFloatParam(const std::string& name, float& out) {
+  double d;
+  if (ros::param::get(name, d)) {
+    out = static_cast<float>(d);
+    return true;
+  }
+  int i;
+  if (ros::param::get(name, i)) {
+    out = static_cast<float>(i);
+    return true;
+  }
+  return false;
+}
+
+// Config last applied to the firmware; used to detect rosparam changes.
+uint8_t applied_control_mode = 0;
+float applied_loop_kp = -1.0f;
+float applied_loop_ki = -1.0f;
+float applied_loop_max = 0.0f;
+float applied_loop_slew = 0.0f;
+
+// Re-read the control_mode + loop tuning params and re-apply live when any changes, so
+//   rosparam set /ll/services/diff_drive/{control_mode,loop_kp,loop_ki,loop_max,loop_slew}
+// takes effect without a restart. The params ARE the interface - no custom topic.
+void applyDiffDriveParamsTimerTask(const ros::TimerEvent&) {
+  if (diff_drive_service == nullptr) {
+    return;
+  }
+  std::string s;
+  if (!ros::param::get("/ll/services/diff_drive/control_mode", s)) {
+    return;
+  }
+  uint8_t mode = 0;
+  if (!controlModeFromString(s, mode)) {
+    return;  // ignore invalid values, keep the current config
+  }
+  float kp = applied_loop_kp, ki = applied_loop_ki, max = applied_loop_max, slew = applied_loop_slew;
+  getFloatParam("/ll/services/diff_drive/loop_kp", kp);
+  getFloatParam("/ll/services/diff_drive/loop_ki", ki);
+  getFloatParam("/ll/services/diff_drive/loop_max", max);
+  getFloatParam("/ll/services/diff_drive/loop_slew", slew);
+
+  if (mode == applied_control_mode && kp == applied_loop_kp && ki == applied_loop_ki && max == applied_loop_max &&
+      slew == applied_loop_slew) {
+    return;
+  }
+  applied_control_mode = mode;
+  applied_loop_kp = kp;
+  applied_loop_ki = ki;
+  applied_loop_max = max;
+  applied_loop_slew = slew;
+  diff_drive_service->ApplyConfiguration(mode, kp, ki, max, slew);
+  ROS_INFO_STREAM("diff_drive config applied: mode=" << s << " loop_kp=" << kp << " loop_ki=" << ki
+                                                     << " loop_max=" << max << " loop_slew=" << slew);
+}
+
 void rtcmReceived(const rtcm_msgs::Message& msg) {
   static std::vector<uint8_t> rtcm_buffer{};
   static ros::Time last_time_sent{0};
@@ -161,11 +232,45 @@ int main(int argc, char** argv) {
   ROS_INFO_STREAM("Wheel ticks [1/m]: " << wheel_ticks_per_m);
   ROS_INFO_STREAM("Wheel distance [m]: " << wheel_distance_m);
 
-  // Opt-in closed-loop wheel speed control (ESC closes the speed loop via COMM_SET_RPM).
-  // Defaults to false -> open-loop duty (unchanged behavior).
-  bool speed_control = false;
-  paramNh.getParam("services/diff_drive/speed_control", speed_control);
-  ROS_INFO_STREAM("Speed control (closed-loop RPM): " << (speed_control ? "enabled" : "disabled"));
+  // Opt-in drive control mode written to the firmware. Defaults to "duty" (open-loop,
+  // unchanged behavior). Accepts:
+  //   duty      - open-loop duty (default)
+  //   duty_loop - firmware PI on measured wheel speed -> duty
+  std::string control_mode_str = "duty";
+  paramNh.getParam("services/diff_drive/control_mode", control_mode_str);
+  uint8_t control_mode = 0;
+  if (!controlModeFromString(control_mode_str, control_mode)) {
+    ROS_WARN_STREAM("Unknown diff_drive control_mode '" << control_mode_str << "', falling back to 'duty'");
+    control_mode_str = "duty";
+    control_mode = 0;
+  }
+  ROS_INFO_STREAM("Drive control mode: " << control_mode_str << " (" << static_cast<int>(control_mode) << ")");
+
+  // Firmware speed-loop gain overrides. Sentinels (Kp/Ki < 0, max <= 0) mean "use the
+  // firmware built-in per-mode gains". Tune live via rosparam set of these keys.
+  float loop_kp = -1.0f, loop_ki = -1.0f, loop_max = 0.0f, loop_slew = 0.0f;
+  getFloatParam("/ll/services/diff_drive/loop_kp", loop_kp);
+  getFloatParam("/ll/services/diff_drive/loop_ki", loop_ki);
+  getFloatParam("/ll/services/diff_drive/loop_max", loop_max);
+  getFloatParam("/ll/services/diff_drive/loop_slew", loop_slew);
+  ROS_INFO_STREAM("Speed-loop tuning: loop_kp=" << loop_kp << " loop_ki=" << loop_ki << " loop_max=" << loop_max
+                                                << " loop_slew=" << loop_slew << " (<0 / <=0 = firmware default)");
+
+  // Baseline for the live param re-read (OnConfigurationRequested applies these values).
+  applied_control_mode = control_mode;
+  applied_loop_kp = loop_kp;
+  applied_loop_ki = loop_ki;
+  applied_loop_max = loop_max;
+  applied_loop_slew = loop_slew;
+
+  // Normalized -> physical translation for the firmware (see SendTwist). A full-scale
+  // command maps to these real speeds. Defaults (0.5 m/s, 0.5 rad/s) reproduce the old
+  // normalized behaviour; raise later as the stack moves to real units.
+  double max_linear_speed = 0.5, max_angular_speed = 0.5;
+  paramNh.getParam("services/diff_drive/max_linear_speed", max_linear_speed);
+  paramNh.getParam("services/diff_drive/max_angular_speed", max_angular_speed);
+  ROS_INFO_STREAM("Twist translation: max_linear_speed=" << max_linear_speed << " m/s, max_angular_speed="
+                                                         << max_angular_speed << " rad/s");
 
   int baud_rate = 0;
   paramNh.getParam("services/gps/baud_rate", baud_rate);
@@ -184,9 +289,10 @@ int main(int argc, char** argv) {
   ROS_INFO_STREAM("GPS protocol: " << protocol << ", baud rate: " << baud_rate
                                    << ", gps port index:" << gps_port_index);
 
-  diff_drive_service = std::make_unique<DiffDriveServiceInterface>(xbot::service_ids::DIFF_DRIVE, ctx, actual_twist_pub,
-                                                                   status_left_esc_pub, status_right_esc_pub,
-                                                                   wheel_ticks_per_m, wheel_distance_m, speed_control);
+  diff_drive_service = std::make_unique<DiffDriveServiceInterface>(
+      xbot::service_ids::DIFF_DRIVE, ctx, actual_twist_pub, status_left_esc_pub, status_right_esc_pub,
+      wheel_ticks_per_m, wheel_distance_m, control_mode, loop_kp, loop_ki, loop_max, loop_slew, max_linear_speed,
+      max_angular_speed);
   diff_drive_service->Start();
 
   // Mower service
@@ -294,6 +400,7 @@ int main(int argc, char** argv) {
   ros::Subscriber cmd_vel_sub = n.subscribe("ll/cmd_vel", 0, velReceived, ros::TransportHints().tcpNoDelay(true));
   ros::Subscriber rtcm_sub = n.subscribe("ll/position/gps/rtcm", 0, rtcmReceived);
   // ros::Subscriber high_level_status_sub = n.subscribe("/mower_logic/current_state", 0, highLevelStatusReceived);
+  ros::Timer control_mode_timer = n.createTimer(ros::Duration(0.5), applyDiffDriveParamsTimerTask);
   ros::Timer publish_timer = n.createTimer(ros::Duration(0.5), sendEmergencyHeartbeatTimerTask);
   ros::Timer publish_timer_2 = n.createTimer(ros::Duration(5.0), sendMowerEnabledTimerTask);
   ros::Subscriber action_sub = n.subscribe("xbot/action", 0, actionReceived, ros::TransportHints().tcpNoDelay(true));

@@ -18,13 +18,14 @@ class DiffDriveServiceInterface : public DiffDriveServiceInterfaceBase {
                             const ros::Publisher& actual_twist_publisher,
                             const ros::Publisher& left_esc_status_publisher,
                             const ros::Publisher& right_esc_status_publisher, double ticks_per_meter,
-                            double wheel_distance)
+                            double wheel_distance, bool speed_control)
       : DiffDriveServiceInterfaceBase(service_id, ctx),
         actual_twist_publisher_(actual_twist_publisher),
         left_esc_status_publisher_(left_esc_status_publisher),
         right_esc_status_publisher_(right_esc_status_publisher),
         wheel_distance_(wheel_distance),
-        ticks_per_meter_(ticks_per_meter) {
+        ticks_per_meter_(ticks_per_meter),
+        speed_control_(speed_control) {
   }
 
   bool OnConfigurationRequested(uint16_t service_id) override;
@@ -49,6 +50,22 @@ class DiffDriveServiceInterface : public DiffDriveServiceInterfaceBase {
   void OnWheelTicksChanged(const uint32_t* new_value, uint32_t length) override;
   void OnLeftESCStatusChanged(const uint8_t& new_value) override;
   void OnRightESCStatusChanged(const uint8_t& new_value) override;
+  void OnLeftESCRpmChanged(const float& new_value) override;
+  void OnRightESCRpmChanged(const float& new_value) override;
+  void OnLeftESCDutyCycleChanged(const float& new_value) override;
+  void OnRightESCDutyCycleChanged(const float& new_value) override;
+  void OnLeftESCInputVoltageChanged(const float& new_value) override;
+  void OnRightESCInputVoltageChanged(const float& new_value) override;
+  void OnLeftESCMotorTemperatureChanged(const float& new_value) override;
+  void OnRightESCMotorTemperatureChanged(const float& new_value) override;
+  void OnLeftESCTachoAbsoluteChanged(const uint32_t& new_value) override;
+  void OnRightESCTachoAbsoluteChanged(const uint32_t& new_value) override;
+  void OnLeftESCDirectionChanged(const uint8_t& new_value) override;
+  void OnRightESCDirectionChanged(const uint8_t& new_value) override;
+  void OnLeftESCFWMajorChanged(const uint8_t& new_value) override;
+  void OnRightESCFWMajorChanged(const uint8_t& new_value) override;
+  void OnLeftESCFWMinorChanged(const uint8_t& new_value) override;
+  void OnRightESCFWMinorChanged(const uint8_t& new_value) override;
 
  private:
   void OnServiceConnected(uint16_t service_id) override;
@@ -66,6 +83,7 @@ class DiffDriveServiceInterface : public DiffDriveServiceInterfaceBase {
   const ros::Publisher& right_esc_status_publisher_;
   double wheel_distance_;
   double ticks_per_meter_;
+  bool speed_control_;
 
   // Store the latest ESC state
   mower_msgs::ESCStatus left_esc_state_{};

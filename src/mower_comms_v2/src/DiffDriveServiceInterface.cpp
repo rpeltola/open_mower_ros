@@ -11,6 +11,8 @@ bool DiffDriveServiceInterface::OnConfigurationRequested(uint16_t service_id) {
   StartTransaction(true);
   SetRegisterWheelDistance(wheel_distance_);
   SetRegisterWheelTicksPerMeter(ticks_per_meter_);
+  // 0 = open-loop duty (default), 1 = closed-loop speed (ESC closes the loop).
+  SetRegisterControlMode(speed_control_ ? 1 : 0);
   CommitTransaction();
   return true;
 }
@@ -70,6 +72,86 @@ void DiffDriveServiceInterface::OnWheelTicksChanged(const uint32_t* new_value, u
 void DiffDriveServiceInterface::OnLeftESCTemperatureChanged(const float& new_value) {
   std::unique_lock<std::mutex> lk{state_mutex_};
   left_esc_state_.temperature_pcb = new_value;
+}
+
+void DiffDriveServiceInterface::OnLeftESCRpmChanged(const float& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  left_esc_state_.rpm = static_cast<int16_t>(new_value);
+}
+
+void DiffDriveServiceInterface::OnRightESCRpmChanged(const float& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  right_esc_state_.rpm = static_cast<int16_t>(new_value);
+}
+
+void DiffDriveServiceInterface::OnLeftESCDutyCycleChanged(const float& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  left_esc_state_.duty_cycle = new_value;
+}
+
+void DiffDriveServiceInterface::OnRightESCDutyCycleChanged(const float& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  right_esc_state_.duty_cycle = new_value;
+}
+
+void DiffDriveServiceInterface::OnLeftESCInputVoltageChanged(const float& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  left_esc_state_.input_voltage = new_value;
+}
+
+void DiffDriveServiceInterface::OnRightESCInputVoltageChanged(const float& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  right_esc_state_.input_voltage = new_value;
+}
+
+void DiffDriveServiceInterface::OnLeftESCMotorTemperatureChanged(const float& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  left_esc_state_.temperature_motor = new_value;
+}
+
+void DiffDriveServiceInterface::OnRightESCMotorTemperatureChanged(const float& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  right_esc_state_.temperature_motor = new_value;
+}
+
+void DiffDriveServiceInterface::OnLeftESCTachoAbsoluteChanged(const uint32_t& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  left_esc_state_.tacho_absolute = new_value;
+}
+
+void DiffDriveServiceInterface::OnRightESCTachoAbsoluteChanged(const uint32_t& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  right_esc_state_.tacho_absolute = new_value;
+}
+
+void DiffDriveServiceInterface::OnLeftESCDirectionChanged(const uint8_t& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  left_esc_state_.direction = new_value;
+}
+
+void DiffDriveServiceInterface::OnRightESCDirectionChanged(const uint8_t& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  right_esc_state_.direction = new_value;
+}
+
+void DiffDriveServiceInterface::OnLeftESCFWMajorChanged(const uint8_t& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  left_esc_state_.fw_major = new_value;
+}
+
+void DiffDriveServiceInterface::OnRightESCFWMajorChanged(const uint8_t& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  right_esc_state_.fw_major = new_value;
+}
+
+void DiffDriveServiceInterface::OnLeftESCFWMinorChanged(const uint8_t& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  left_esc_state_.fw_minor = new_value;
+}
+
+void DiffDriveServiceInterface::OnRightESCFWMinorChanged(const uint8_t& new_value) {
+  std::unique_lock<std::mutex> lk{state_mutex_};
+  right_esc_state_.fw_minor = new_value;
 }
 
 void DiffDriveServiceInterface::OnServiceConnected(uint16_t service_id) {

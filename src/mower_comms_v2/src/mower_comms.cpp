@@ -161,6 +161,12 @@ int main(int argc, char** argv) {
   ROS_INFO_STREAM("Wheel ticks [1/m]: " << wheel_ticks_per_m);
   ROS_INFO_STREAM("Wheel distance [m]: " << wheel_distance_m);
 
+  // Opt-in closed-loop wheel speed control (ESC closes the speed loop via COMM_SET_RPM).
+  // Defaults to false -> open-loop duty (unchanged behavior).
+  bool speed_control = false;
+  paramNh.getParam("services/diff_drive/speed_control", speed_control);
+  ROS_INFO_STREAM("Speed control (closed-loop RPM): " << (speed_control ? "enabled" : "disabled"));
+
   int baud_rate = 0;
   paramNh.getParam("services/gps/baud_rate", baud_rate);
 
@@ -180,7 +186,7 @@ int main(int argc, char** argv) {
 
   diff_drive_service = std::make_unique<DiffDriveServiceInterface>(xbot::service_ids::DIFF_DRIVE, ctx, actual_twist_pub,
                                                                    status_left_esc_pub, status_right_esc_pub,
-                                                                   wheel_ticks_per_m, wheel_distance_m);
+                                                                   wheel_ticks_per_m, wheel_distance_m, speed_control);
   diff_drive_service->Start();
 
   // Mower service

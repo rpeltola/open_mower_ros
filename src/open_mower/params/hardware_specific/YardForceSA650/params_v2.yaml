@@ -3,6 +3,9 @@ ll:
     diff_drive:
       wheel_distance_m: 0.325
       ticks_per_m: 1964.0
+      # Opt-in closed-loop wheel speed control (ESC closes the loop via COMM_SET_RPM).
+      # false = open-loop duty (default). Tune the xESC s_pid_* gains before enabling.
+      speed_control: false
     power:
       battery_full_voltage: 27.0
       battery_empty_voltage: 24.0

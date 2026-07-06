@@ -11,6 +11,8 @@ bool raspberry_pi_power
 bool is_charging
 bool esc_power
 bool rain_detected
+# Raw main-board rain sensor reading (ADC counts); 0 when no such sensor is present.
+uint32 rain_value
 bool sound_module_available
 bool sound_module_busy
 bool ui_board_available

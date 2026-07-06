@@ -22,6 +22,10 @@ void MowerServiceInterface::OnRainDetectedChanged(const uint8_t& new_value) {
   status_msg_.rain_detected = new_value;
 }
 
+void MowerServiceInterface::OnRainValueChanged(const uint32_t& new_value) {
+  status_msg_.rain_value = new_value;
+}
+
 void MowerServiceInterface::OnMowerRunningChanged(const uint8_t& new_value) {
   // TODO: set a flag, if the mower is actually running or not.
 }
@@ -45,6 +49,9 @@ void MowerServiceInterface::OnMowerMotorRPMChanged(const float& new_value) {
 void MowerServiceInterface::OnServiceConnected(uint16_t service_id) {
   status_msg_ = {};
   SendMowerEnabled(false);
+  // Push the (rarely-changing) rain threshold once per connection; it is
+  // re-sent automatically on every reconnect (e.g. firmware restart).
+  SendRainThreshold(rain_threshold_);
 }
 
 void MowerServiceInterface::OnTransactionStart(uint64_t timestamp) {

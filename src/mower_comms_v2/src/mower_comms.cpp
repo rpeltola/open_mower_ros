@@ -184,8 +184,16 @@ int main(int argc, char** argv) {
   diff_drive_service->Start();
 
   // Mower service
+  int rain_threshold = 0;  // raw ADC counts; 0 = rain detection disabled
+  paramNh.getParam("services/mower/rain_threshold", rain_threshold);
+  // Clamp to the sensor's raw 16-bit range: negative -> disabled (0), and a
+  // value above 65535 can never be reached so it would silently never trigger.
+  if (rain_threshold < 0) rain_threshold = 0;
+  if (rain_threshold > 65535) rain_threshold = 65535;
+  ROS_INFO_STREAM("Rain threshold: " << rain_threshold << (rain_threshold == 0 ? " (rain detection disabled)" : ""));
   status_pub = n.advertise<mower_msgs::Status>("ll/mower_status", 1);
-  mower_service = std::make_unique<MowerServiceInterface>(xbot::service_ids::MOWER, ctx, status_pub);
+  mower_service = std::make_unique<MowerServiceInterface>(xbot::service_ids::MOWER, ctx, status_pub,
+                                                          static_cast<uint32_t>(rain_threshold));
   mower_service->Start();
 
   // IMU service

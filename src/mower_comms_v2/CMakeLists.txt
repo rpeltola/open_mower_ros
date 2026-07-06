@@ -15,6 +15,7 @@ find_package(catkin REQUIRED COMPONENTS
         xesc_msgs
         xbot_msgs
         robot_localization
+        xbot_mqtt
 )
 
 find_package(
@@ -182,6 +183,7 @@ add_executable(mower_comms_v2
         src/GpsServiceInterface.h
         src/HighLevelServiceInterface.cpp
         src/HighLevelServiceInterface.h
+        src/FilesystemServiceInterface.h
 )
 
 target_add_service_interface(mower_comms_v2 ImuServiceInterface ${CMAKE_CURRENT_SOURCE_DIR}/../../services/imu_service.json)
@@ -193,10 +195,11 @@ target_add_service_interface(mower_comms_v2 BmsServiceInterface ${CMAKE_CURRENT_
 target_add_service_interface(mower_comms_v2 GpsServiceInterface ${CMAKE_CURRENT_SOURCE_DIR}/../../services/gps_service.json)
 target_add_service_interface(mower_comms_v2 InputServiceInterface ${CMAKE_CURRENT_SOURCE_DIR}/../../services/input_service.json)
 target_add_service_interface(mower_comms_v2 HighLevelServiceInterface ${CMAKE_CURRENT_SOURCE_DIR}/../../services/high_level_service.json)
+target_add_service_interface(mower_comms_v2 FilesystemServiceInterface ${CMAKE_CURRENT_SOURCE_DIR}/../../services/filesystem_service.json)
 
 add_subdirectory(lib/libfyaml)
 add_dependencies(mower_comms_v2 ${catkin_EXPORTED_TARGETS} ${${PROJECT_NAME}_EXPORTED_TARGETS})
-target_link_libraries(mower_comms_v2 PUBLIC ${catkin_LIBRARIES} ${GeographicLib_LIBRARIES} fyaml)
+target_link_libraries(mower_comms_v2 PUBLIC ${catkin_LIBRARIES} ${GeographicLib_LIBRARIES} fyaml xbot_mqtt)
 
 #############
 ## Install ##

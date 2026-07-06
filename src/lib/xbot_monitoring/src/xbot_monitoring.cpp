@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <boost/regex.hpp>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -335,7 +336,16 @@ void publish_version() {
 }
 
 void publish_capabilities() {
-  try_publish("capabilities/json", CAPABILITIES.dump(2), true);
+  nlohmann::ordered_json capabilities = CAPABILITIES;
+  // The filesystem RPC and I2S audio output are V2-mainboard features (served by mower_comms_v2 /
+  // the STM32H723 FilesystemService + MAX98357A). Only advertise them on V2 hardware so the app
+  // feature-gates the audio UI accordingly.
+  const char* hardware_platform = std::getenv("HARDWARE_PLATFORM");
+  if (hardware_platform != nullptr && std::string(hardware_platform) == "2") {
+    capabilities["fs"] = 1;
+    capabilities["audio"] = 1;
+  }
+  try_publish("capabilities/json", capabilities.dump(2), true);
 }
 
 #pragma GCC diagnostic push

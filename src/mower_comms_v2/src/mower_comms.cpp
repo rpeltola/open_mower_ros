@@ -27,16 +27,28 @@
 #include <spdlog/spdlog.h>
 #include <std_msgs/String.h>
 
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
 #include "../../../services/service_ids.h"
 #include "BmsServiceInterface.h"
 #include "DiffDriveServiceInterface.h"
 #include "EmergencyServiceInterface.h"
+#include "FilesystemServiceInterface.h"
 #include "GpsServiceInterface.h"
 #include "HighLevelServiceInterface.h"
 #include "ImuServiceInterface.h"
 #include "InputServiceInterface.h"
 #include "MowerServiceInterface.h"
 #include "PowerServiceInterface.h"
+
+// RPC
+#include "xbot_mqtt/provider.h"
 
 ros::Publisher status_pub;
 ros::Publisher nmea_pub;
@@ -62,8 +74,154 @@ std::unique_ptr<BmsServiceInterface> bms_service = nullptr;
 std::unique_ptr<GpsServiceInterface> gps_service = nullptr;
 std::unique_ptr<InputServiceInterface> input_service = nullptr;
 std::unique_ptr<HighLevelServiceInterface> high_level_service = nullptr;
+std::unique_ptr<FilesystemServiceInterface> fs_service = nullptr;
 
 xbot::serviceif::Context ctx{};
+
+namespace {
+
+// Decodes a base64 string into raw bytes. Throws std::invalid_argument on malformed input.
+std::vector<uint8_t> base64Decode(const std::string& encoded) {
+  static const std::array<int8_t, 256> kDecodeTable = [] {
+    std::array<int8_t, 256> table{};
+    table.fill(-1);
+    const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < alphabet.size(); ++i) {
+      table[static_cast<uint8_t>(alphabet[i])] = static_cast<int8_t>(i);
+    }
+    return table;
+  }();
+
+  std::vector<uint8_t> result;
+  result.reserve(encoded.size() / 4 * 3 + 3);
+
+  uint32_t buffer = 0;
+  int bits_collected = 0;
+  for (char c : encoded) {
+    if (c == '=') break;
+    if (std::isspace(static_cast<unsigned char>(c))) continue;
+    int8_t value = kDecodeTable[static_cast<uint8_t>(c)];
+    if (value < 0) {
+      throw std::invalid_argument("Invalid base64 character");
+    }
+    buffer = (buffer << 6) | static_cast<uint32_t>(value);
+    bits_collected += 6;
+    if (bits_collected >= 8) {
+      bits_collected -= 8;
+      result.push_back(static_cast<uint8_t>((buffer >> bits_collected) & 0xFF));
+    }
+  }
+  return result;
+}
+
+// Returns the name of an FsResult value for use in RPC error messages.
+const char* fsResultName(FsResult result) {
+  switch (result) {
+    case FsResult::OK: return "OK";
+    case FsResult::ERR_IO: return "ERR_IO";
+    case FsResult::ERR_NOENT: return "ERR_NOENT";
+    case FsResult::ERR_INVAL: return "ERR_INVAL";
+    case FsResult::ERR_NOSPC: return "ERR_NOSPC";
+    case FsResult::ERR_SESSION: return "ERR_SESSION";
+    case FsResult::ERR_PATH: return "ERR_PATH";
+  }
+  return "UNKNOWN";
+}
+
+}  // namespace
+
+// clang-format off
+xbot_mqtt::RpcProvider fs_rpc_provider("mower_comms_v2", {{
+  RPC_METHOD("fs.list", {
+    std::string path;
+    if (params.is_object() && params.contains("path") && params.at("path").is_string()) {
+      path = params.at("path").get<std::string>();
+    }
+    char buf[1024];
+    uint16_t result_length = sizeof(buf);
+    if (!fs_service->CallListFiles(path.c_str(), path.size() + 1, buf, result_length)) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, "fs list failed");
+    }
+    std::string listing(buf, result_length);
+    nlohmann::json files = nlohmann::json::array();
+    size_t pos = 0;
+    while (pos < listing.size()) {
+      size_t line_end = listing.find('\n', pos);
+      std::string line = listing.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+      size_t tab = line.find('\t');
+      if (tab != std::string::npos) {
+        nlohmann::json entry;
+        entry["name"] = line.substr(0, tab);
+        entry["size"] = std::stoull(line.substr(tab + 1));
+        files.push_back(entry);
+      }
+      if (line_end == std::string::npos) break;
+      pos = line_end + 1;
+    }
+    nlohmann::json response;
+    response["files"] = files;
+    return response;
+  }),
+  RPC_METHOD("fs.remove", {
+    if (!params.is_object() || !params.contains("path") || !params.at("path").is_string() ||
+        params.at("path").get<std::string>().empty()) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INVALID_PARAMS, "Missing path parameter");
+    }
+    std::string path = params.at("path").get<std::string>();
+    uint8_t result = 0;
+    if (!fs_service->CallRemoveFile(path.c_str(), path.size() + 1, result)) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, "fs remove failed");
+    }
+    if (static_cast<FsResult>(result) != FsResult::OK) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, fsResultName(static_cast<FsResult>(result)));
+    }
+    nlohmann::json response;
+    response["ok"] = true;
+    return response;
+  }),
+  RPC_METHOD("fs.write", {
+    if (!params.is_object() || !params.contains("path") || !params.at("path").is_string() ||
+        params.at("path").get<std::string>().empty()) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INVALID_PARAMS, "Missing path parameter");
+    }
+    if (!params.contains("data") || !params.at("data").is_string()) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INVALID_PARAMS, "Missing data parameter");
+    }
+    std::string path = params.at("path").get<std::string>();
+    std::vector<uint8_t> data;
+    try {
+      data = base64Decode(params.at("data").get<std::string>());
+    } catch (const std::exception& e) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INVALID_PARAMS,
+                                    std::string("Invalid base64 data: ") + e.what());
+    }
+
+    constexpr size_t kMaxChunkSize = 1024;
+    const size_t total = data.size();
+    uint32_t offset = 0;
+    do {
+      const size_t chunk_size = std::min(kMaxChunkSize, total - offset);
+      uint8_t flags = 0;
+      if (offset == 0) flags |= FsChunkFlags::FIRST;
+      if (offset + chunk_size == total) flags |= FsChunkFlags::LAST;
+      uint8_t result = 0;
+      if (!fs_service->CallAddFileChunk(path.c_str(), path.size() + 1, offset, flags, data.data() + offset,
+                                        static_cast<uint32_t>(chunk_size), result)) {
+        throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, "fs write failed");
+      }
+      if (static_cast<FsResult>(result) != FsResult::OK) {
+        throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, fsResultName(static_cast<FsResult>(result)));
+      }
+      offset += static_cast<uint32_t>(chunk_size);
+    } while (offset < total);
+
+    nlohmann::json response;
+    response["ok"] = true;
+    response["bytes"] = total;
+    return response;
+  }),
+}});
+// clang-format on
 
 bool setEmergencyStop(mower_msgs::EmergencyStopSrvRequest& req, mower_msgs::EmergencyStopSrvResponse& res) {
   emergency_service->SetHighLevelEmergency(req.emergency);
@@ -129,6 +287,8 @@ int main(int argc, char** argv) {
 
   ros::NodeHandle n;
   ros::NodeHandle paramNh("/ll");
+
+  fs_rpc_provider.init();
 
   highLevelClient = n.serviceClient<mower_msgs::HighLevelControlSrv>("mower_service/high_level_control");
   action_pub = n.advertise<std_msgs::String>("xbot/action", 1);
@@ -290,6 +450,10 @@ int main(int argc, char** argv) {
   // HighLevel service
   high_level_service = std::make_unique<HighLevelServiceInterface>(xbot::service_ids::HIGH_LEVEL, ctx);
   high_level_service->Start();
+
+  // Filesystem service
+  fs_service = std::make_unique<FilesystemServiceInterface>(xbot::service_ids::FILESYSTEM, ctx);
+  fs_service->Start();
 
   // All subscriptions, timers and service servers are registered after all service interfaces are
   // fully constructed, so callbacks can never fire on null pointers.

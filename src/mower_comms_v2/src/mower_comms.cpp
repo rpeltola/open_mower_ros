@@ -137,11 +137,15 @@ xbot_mqtt::RpcProvider fs_rpc_provider("mower_comms_v2", {{
     if (params.is_object() && params.contains("path") && params.at("path").is_string()) {
       path = params.at("path").get<std::string>();
     }
+    ROS_INFO_STREAM("fs.list: path='" << path << "' (len " << path.size() << ")");
     char buf[1024];
     uint16_t result_length = sizeof(buf);
-    if (!fs_service->CallListFiles(path.c_str(), path.size() + 1, buf, result_length)) {
+    if (!fs_service->CallListFiles(path.c_str(), path.size(), buf, result_length)) {
+      ROS_ERROR_STREAM("fs.list: CallListFiles FAILED for path='" << path
+                       << "' (RPC timeout or firmware ERROR - see SendRpc log + firmware ULOG)");
       throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, "fs list failed");
     }
+    ROS_INFO_STREAM("fs.list: firmware returned " << result_length << " bytes");
     std::string listing(buf, result_length);
     nlohmann::json files = nlohmann::json::array();
     size_t pos = 0;
@@ -168,10 +172,15 @@ xbot_mqtt::RpcProvider fs_rpc_provider("mower_comms_v2", {{
       throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INVALID_PARAMS, "Missing path parameter");
     }
     std::string path = params.at("path").get<std::string>();
+    ROS_INFO_STREAM("fs.remove: path='" << path << "' (len " << path.size() << ")");
     uint8_t result = 0;
-    if (!fs_service->CallRemoveFile(path.c_str(), path.size() + 1, result)) {
+    if (!fs_service->CallRemoveFile(path.c_str(), path.size(), result)) {
+      ROS_ERROR_STREAM("fs.remove: CallRemoveFile FAILED for path='" << path
+                       << "' (RPC timeout or firmware ERROR - see SendRpc log + firmware ULOG)");
       throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, "fs remove failed");
     }
+    ROS_INFO_STREAM("fs.remove: firmware FsResult=" << static_cast<int>(result) << " ("
+                    << fsResultName(static_cast<FsResult>(result)) << ")");
     if (static_cast<FsResult>(result) != FsResult::OK) {
       throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, fsResultName(static_cast<FsResult>(result)));
     }
@@ -198,6 +207,7 @@ xbot_mqtt::RpcProvider fs_rpc_provider("mower_comms_v2", {{
 
     constexpr size_t kMaxChunkSize = 1024;
     const size_t total = data.size();
+    ROS_INFO_STREAM("fs.write: path='" << path << "' (len " << path.size() << ") total=" << total << " bytes");
     uint32_t offset = 0;
     do {
       const size_t chunk_size = std::min(kMaxChunkSize, total - offset);
@@ -205,15 +215,22 @@ xbot_mqtt::RpcProvider fs_rpc_provider("mower_comms_v2", {{
       if (offset == 0) flags |= FsChunkFlags::FIRST;
       if (offset + chunk_size == total) flags |= FsChunkFlags::LAST;
       uint8_t result = 0;
-      if (!fs_service->CallAddFileChunk(path.c_str(), path.size() + 1, offset, flags, data.data() + offset,
+      ROS_INFO_STREAM("fs.write: chunk offset=" << offset << " size=" << chunk_size
+                      << " flags=0x" << std::hex << static_cast<int>(flags) << std::dec);
+      if (!fs_service->CallAddFileChunk(path.c_str(), path.size(), offset, flags, data.data() + offset,
                                         static_cast<uint32_t>(chunk_size), result)) {
+        ROS_ERROR_STREAM("fs.write: CallAddFileChunk FAILED at offset=" << offset
+                         << " (RPC timeout or firmware ERROR - see SendRpc log + firmware ULOG)");
         throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, "fs write failed");
       }
       if (static_cast<FsResult>(result) != FsResult::OK) {
+        ROS_ERROR_STREAM("fs.write: firmware FsResult=" << static_cast<int>(result) << " ("
+                         << fsResultName(static_cast<FsResult>(result)) << ") at offset=" << offset);
         throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, fsResultName(static_cast<FsResult>(result)));
       }
       offset += static_cast<uint32_t>(chunk_size);
     } while (offset < total);
+    ROS_INFO_STREAM("fs.write: completed path='" << path << "' " << total << " bytes");
 
     nlohmann::json response;
     response["ok"] = true;

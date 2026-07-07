@@ -3,6 +3,15 @@ ll:
     diff_drive:
       wheel_distance_m: 0.45
       ticks_per_m: 1195.0
+      # Drive control mode:
+      #   duty      - open-loop duty (default, unchanged behavior)
+      #   duty_loop - firmware PI on measured wheel speed -> duty (opt-in, to try)
+      control_mode: duty
+      # Translation of the normalized [-1,1] high-level twist to the physical units the
+      # firmware now expects. Full-scale command (1.0) -> these real speeds. Defaults
+      # reproduce the legacy behaviour; the firmware safety-caps well above these.
+      max_linear_speed: 0.5    # m/s at full command
+      max_angular_speed: 0.5   # rad/s at full command
     gps:
       protocol: "NMEA"
       baudrate: 921600

@@ -10,3 +10,9 @@ uint32  tacho
 int16   rpm
 float32 temperature_motor
 float32 temperature_pcb
+float32 duty_cycle
+float32 input_voltage
+uint32  tacho_absolute
+uint8   direction
+uint8   fw_major
+uint8   fw_minor

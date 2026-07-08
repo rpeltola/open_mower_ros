@@ -1,0 +1,14 @@
+# Request a refill plan for a mowing area based on the coverage accumulated so far.
+#
+# The coverage_feedback node compares the (eroded) area polygon against the ground it
+# has observed the blade actually cut, declutters the difference, and returns slic3r
+# fill paths for any uncovered patches that exceed the configured gap thresholds.
+#
+# An empty `paths` response means coverage is sufficient (nothing worth re-mowing, or the
+# remaining uncovered area is below residual_stop_area) and the caller may proceed to dock.
+mower_map/MapArea area
+float64 tool_width        # mower cut width (m); <= 0 to fall back to the node's tool_width param
+---
+slic3r_coverage_planner/Path[] paths   # fill passes to append to the mowing plan
+float64 uncovered_area                 # total uncovered area (m^2) of the kept gap clusters
+int32 gap_count                        # number of gap clusters that produced fill paths

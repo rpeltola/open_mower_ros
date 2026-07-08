@@ -22,18 +22,78 @@
 #include <rosbag/bag.h>
 #include <rosbag/view.h>
 
+#include <algorithm>
 #include <cmath>
+#include <utility>
+#include <vector>
 
+#include "coverage_feedback/GetFillPaths.h"
 #include "mower_logic/CheckPoint.h"
 #include "mower_map/ClearNavPointSrv.h"
 #include "mower_map/GetMowingAreaSrv.h"
 #include "mower_map/SetNavPointSrv.h"
+
+namespace {
+// Squared distance from point p to the segment a-b.
+double pointSegmentDistSq(double px, double py, double ax, double ay, double bx, double by) {
+  const double dx = bx - ax, dy = by - ay;
+  const double len2 = dx * dx + dy * dy;
+  double t = len2 > 0.0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0.0;
+  t = std::max(0.0, std::min(1.0, t));
+  const double ex = px - (ax + t * dx), ey = py - (ay + t * dy);
+  return ex * ex + ey * ey;
+}
+
+// Ramer-Douglas-Peucker: keep points that lie farther than `eps` from the simplified line (same
+// algorithm xbot_monitoring uses to compact the actual track in PositionHistory).
+void rdpKeep(const std::vector<std::pair<double, double>>& pts, size_t i, size_t j, double eps_sq,
+             std::vector<bool>& keep) {
+  if (j <= i + 1) return;
+  double max_d = 0.0;
+  size_t max_k = i;
+  for (size_t k = i + 1; k < j; k++) {
+    const double d =
+        pointSegmentDistSq(pts[k].first, pts[k].second, pts[i].first, pts[i].second, pts[j].first, pts[j].second);
+    if (d > max_d) {
+      max_d = d;
+      max_k = k;
+    }
+  }
+  if (max_d > eps_sq) {
+    keep[max_k] = true;
+    rdpKeep(pts, i, max_k, eps_sq, keep);
+    rdpKeep(pts, max_k, j, eps_sq, keep);
+  }
+}
+
+// Simplify a planned-path polyline for the overlay: RDP at `eps` metres, coordinates rounded to mm.
+// The slic3r plan ships every vertex; for a grey overlay the lanes are near-straight, so this drops
+// the large majority of points (and the MQTT payload size) with no visible difference.
+json simplifyPathPoints(const std::vector<geometry_msgs::PoseStamped>& poses, double eps) {
+  std::vector<std::pair<double, double>> pts;
+  pts.reserve(poses.size());
+  for (const auto& ps : poses) pts.emplace_back(ps.pose.position.x, ps.pose.position.y);
+
+  json out = json::array();
+  if (pts.empty()) return out;
+  std::vector<bool> keep(pts.size(), false);
+  keep.front() = keep.back() = true;
+  if (pts.size() > 2) rdpKeep(pts, 0, pts.size() - 1, eps * eps, keep);
+
+  const auto round_mm = [](double v) { return std::round(v * 1000.0) / 1000.0; };
+  for (size_t k = 0; k < pts.size(); k++) {
+    if (keep[k]) out.push_back({round_mm(pts[k].first), round_mm(pts[k].second)});
+  }
+  return out;
+}
+}  // namespace
 
 extern ros::ServiceClient mapClient;
 extern ros::ServiceClient pathClient;
 extern ros::ServiceClient pathProgressClient;
 extern ros::ServiceClient setNavPointClient;
 extern ros::ServiceClient clearNavPointClient;
+extern ros::ServiceClient coverageFeedbackClient;
 
 extern actionlib::SimpleActionClient<mbf_msgs::MoveBaseAction>* mbfClient;
 extern actionlib::SimpleActionClient<mbf_msgs::ExePathAction>* mbfClientExePath;
@@ -44,6 +104,8 @@ extern void setConfig(mower_logic::MowerLogicConfig);
 extern void registerActions(std::string prefix, const std::vector<xbot_msgs::ActionInfo>& actions);
 
 extern std::string current_job_id;
+extern std::string current_session_id;
+extern std::string generateNanoId(size_t length);
 extern bool current_job_finished;
 
 MowingBehavior MowingBehavior::INSTANCE;
@@ -53,6 +115,15 @@ std::string MowingBehavior::state_name() {
     return "PAUSED";
   }
   return "MOWING";
+}
+
+std::string MowingBehavior::sub_state_name() {
+  // Mark the time window during which coverage-feedback fill paths are being executed, so it is
+  // visible in /mower_logic/current_state (and any recorded bag) which mowing was a re-mow.
+  if (refill_round > 0) {
+    return "REFILL " + std::to_string(refill_round) + "/" + std::to_string(getConfig().max_refill_rounds);
+  }
+  return "";
 }
 
 Behavior* MowingBehavior::execute() {
@@ -79,12 +150,21 @@ Behavior* MowingBehavior::execute() {
     ROS_INFO_STREAM("MowingBehavior: Executing mowing plan");
     bool finished = execute_mowing_plan();
     if (finished) {
+      // Coverage feedback: before leaving this area, check the ground we actually cut against the
+      // area polygon and, if patches were missed, run fill passes instead of docking. Bounded by a
+      // per-area round cap so untraversable spots can't loop forever.
+      if (request_coverage_refill()) {
+        // Fill paths were queued into currentMowingPaths; re-run the plan on them (do not advance
+        // the area or dock yet).
+        continue;
+      }
       // skip to next area if current
       ROS_INFO_STREAM("MowingBehavior: Executing mowing plan - finished");
       currentMowingArea++;
       currentMowingPaths.clear();
       currentMowingPath = 0;
       currentMowingPathIndex = 0;
+      refill_round = 0;
     }
   }
 
@@ -96,10 +176,70 @@ Behavior* MowingBehavior::execute() {
   return &DockingBehavior::INSTANCE;
 }
 
+bool MowingBehavior::request_coverage_refill() {
+  if (!getConfig().coverage_feedback_enabled) {
+    return false;
+  }
+  // execute_mowing_plan() also returns true when the area was skipped (skip_area clears the paths);
+  // a real completion leaves currentMowingPaths populated. Never re-mow a deliberately skipped area.
+  if (currentMowingPaths.empty()) {
+    return false;
+  }
+  if (refill_round >= getConfig().max_refill_rounds) {
+    ROS_INFO_STREAM("MowingBehavior: coverage refill round cap (" << getConfig().max_refill_rounds
+                                                                  << ") reached - docking.");
+    return false;
+  }
+  if (currentMowingAreaData.area.points.size() < 3) {
+    return false;
+  }
+
+  coverage_feedback::GetFillPaths srv;
+  srv.request.area = currentMowingAreaData;
+  srv.request.tool_width = getConfig().tool_width;
+  if (!coverageFeedbackClient.call(srv)) {
+    ROS_WARN_STREAM("MowingBehavior: coverage_feedback service unavailable - proceeding to dock.");
+    return false;
+  }
+  if (srv.response.paths.empty()) {
+    ROS_INFO_STREAM("MowingBehavior: coverage sufficient (" << srv.response.uncovered_area
+                                                            << " m^2 uncovered) - no refill needed.");
+    publishMowerEvent("COVERAGE_OK", json{{"area_id", currentMowingAreaData.id},
+                                          {"area_name", currentMowingAreaData.name},
+                                          {"uncovered_m2", srv.response.uncovered_area}});
+    return false;
+  }
+
+  refill_round++;
+  // A fix-up (refill) pass is a new SESSION within the same job (Option 1): the job_id is kept so
+  // the cumulative coverage carries over and all passes group under one job, while a fresh
+  // session_id makes this pass's driven track recordable distinctly (same model as pause/resume).
+  current_session_id = generateNanoId(32);
+  ROS_INFO_STREAM("MowingBehavior: coverage refill round " << refill_round << "/" << getConfig().max_refill_rounds
+                                                           << " - " << srv.response.gap_count << " gap(s), "
+                                                           << srv.response.uncovered_area << " m^2 to re-mow.");
+  publishMowerEvent("COVERAGE_REFILL", json{{"area_id", currentMowingAreaData.id},
+                                            {"area_name", currentMowingAreaData.name},
+                                            {"round", refill_round},
+                                            {"max_rounds", getConfig().max_refill_rounds},
+                                            {"gaps", srv.response.gap_count},
+                                            {"uncovered_m2", srv.response.uncovered_area}});
+  currentMowingPaths = srv.response.paths;
+  currentMowingPath = 0;
+  currentMowingPathIndex = 0;
+  // Invalidate the checkpoint digest: while fill paths run, the saved path/index refer to the fill
+  // plan, not the original area plan. If we crash mid-refill and restart, create_mowing_plan()
+  // rebuilds the original area plan whose digest then won't match, so it restarts the area from the
+  // beginning (re-mowing it) rather than resuming at a misaligned index.
+  currentMowingPlanDigest = "";
+  return true;
+}
+
 void MowingBehavior::enter() {
   skip_area = false;
   skip_path = false;
   paused = aborted = false;
+  refill_round = 0;
 
   for (auto& a : actions) {
     a.enabled = true;
@@ -118,6 +258,7 @@ void MowingBehavior::reset() {
   publishMowerEvent("JOB_COMPLETE");
   current_job_finished = true;
   currentMowingPaths.clear();
+  refill_round = 0;
   currentMowingArea = 0;
   currentMowingPath = 0;
   currentMowingPathIndex = 0;
@@ -166,6 +307,8 @@ bool MowingBehavior::create_mowing_plan(int area_index) {
 
   currentMowingAreaId = mapSrv.response.area.id;
   currentMowingAreaName = mapSrv.response.area.name;
+  // Cache the full area (polygon + obstacles) for the coverage-feedback check at area finish.
+  currentMowingAreaData = mapSrv.response.area;
 
   if (!mapSrv.response.area.active) {
     ROS_INFO_STREAM("MowingBehavior: Skipping inactive mowing area");
@@ -229,6 +372,31 @@ bool MowingBehavior::create_mowing_plan(int area_index) {
   }
 
   currentMowingPaths = pathSrv.response.paths;
+
+  // Publish the slic3r-planned mowing path (map frame, metres) as JSON so xbot_monitoring can bridge it
+  // to MQTT and the app can draw the planned coverage overlay (grey) over the actual driven path.
+  {
+    json planned;
+    planned["job_id"] = current_job_id;
+    // step_index is the plan's ordinal position in the job and is the sole storage key (area order
+    // today, task order once the Tasklist feature lands), so the same area mowed more than once in a
+    // job stays distinct. area_id/angle/offset are stored as metadata only.
+    planned["step_index"] = area_index;
+    planned["area_id"] = currentMowingAreaId;
+    planned["angle"] = angle;
+    planned["offset"] = mow_angle_offset;
+    planned["paths"] = json::array();
+    for (const auto& path : currentMowingPaths) {
+      json path_json;
+      path_json["is_outline"] = path.is_outline != 0;
+      // Simplify for the overlay (RDP @ 1 cm, like PositionHistory's track compaction, + mm
+      // rounding) so the MQTT payload stays small without visibly cutting curves/turns; the
+      // full-resolution path is still executed from currentMowingPaths.
+      path_json["points"] = simplifyPathPoints(path.path.poses, 0.01);
+      planned["paths"].push_back(path_json);
+    }
+    publishPlannedPath(planned.dump());
+  }
 
   // Calculate mowing plan digest from the poses
   // TODO: move to slic3r_coverage_planner

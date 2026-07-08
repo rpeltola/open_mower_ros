@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+<package format="2">
+    <name>coverage_feedback</name>
+    <version>0.0.0</version>
+    <description>
+        Coverage-feedback re-mow: tracks the ground actually cut while mowing and, on area
+        completion, detects uncovered patches and generates slic3r fill passes to close them
+        before docking.
+    </description>
+    <maintainer email="reko.peltola@gmail.com">Reko Peltola</maintainer>
+    <license>CC BY-NC-SA 4.0</license>
+
+    <url type="website">https://github.com/ClemensElflein/OpenMower</url>
+
+    <buildtool_depend>catkin</buildtool_depend>
+
+    <build_depend>roscpp</build_depend>
+    <build_depend>message_generation</build_depend>
+    <build_depend>std_msgs</build_depend>
+    <build_depend>std_srvs</build_depend>
+    <build_depend>geometry_msgs</build_depend>
+    <build_depend>nav_msgs</build_depend>
+    <build_depend>visualization_msgs</build_depend>
+    <build_depend>mower_map</build_depend>
+    <build_depend>mower_msgs</build_depend>
+    <build_depend>slic3r_coverage_planner</build_depend>
+    <build_depend>xbot_msgs</build_depend>
+
+    <build_export_depend>roscpp</build_export_depend>
+    <build_export_depend>message_generation</build_export_depend>
+    <build_export_depend>std_msgs</build_export_depend>
+    <build_export_depend>std_srvs</build_export_depend>
+    <build_export_depend>geometry_msgs</build_export_depend>
+    <build_export_depend>nav_msgs</build_export_depend>
+    <build_export_depend>visualization_msgs</build_export_depend>
+    <build_export_depend>mower_map</build_export_depend>
+    <build_export_depend>mower_msgs</build_export_depend>
+    <build_export_depend>slic3r_coverage_planner</build_export_depend>
+    <build_export_depend>xbot_msgs</build_export_depend>
+
+    <exec_depend>message_runtime</exec_depend>
+    <exec_depend>roscpp</exec_depend>
+    <exec_depend>std_msgs</exec_depend>
+    <exec_depend>std_srvs</exec_depend>
+    <exec_depend>geometry_msgs</exec_depend>
+    <exec_depend>nav_msgs</exec_depend>
+    <exec_depend>visualization_msgs</exec_depend>
+    <exec_depend>mower_map</exec_depend>
+    <exec_depend>mower_msgs</exec_depend>
+    <exec_depend>slic3r_coverage_planner</exec_depend>
+    <exec_depend>xbot_msgs</exec_depend>
+
+    <!-- The export tag contains other, unspecified, tags -->
+    <export>
+        <!-- Other tools can request additional information be placed here -->
+    </export>
+</package>

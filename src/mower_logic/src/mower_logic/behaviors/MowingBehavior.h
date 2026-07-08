@@ -18,6 +18,7 @@
 #include "Behavior.h"
 #include "UndockingBehavior.h"
 #include "ftc_local_planner/PlannerGetProgress.h"
+#include "mower_map/MapArea.h"
 #include "slic3r_coverage_planner/Path.h"
 #include "slic3r_coverage_planner/PlanPath.h"
 #include "xbot_msgs/ActionInfo.h"
@@ -31,6 +32,18 @@ class MowingBehavior : public Behavior {
   bool create_mowing_plan(int area_index);
 
   bool execute_mowing_plan();
+
+  // Coverage feedback: after an area's plan finishes, ask the coverage_feedback node for fill
+  // passes covering any ground the blade missed and, if there are any (and we are under the
+  // per-area round cap), queue them into currentMowingPaths so they run before docking. Returns
+  // true when fill paths were queued (caller should keep mowing), false to proceed to docking.
+  bool request_coverage_refill();
+
+  // Most recently loaded mowing area (cached in create_mowing_plan) so the coverage check has the
+  // true polygon + obstacles without an extra map service round-trip.
+  mower_map::MapArea currentMowingAreaData;
+  // Coverage-feedback refill rounds spent on the current area (bounded by max_refill_rounds).
+  int refill_round = 0;
 
   // Progress
   bool mowerEnabled = false;
@@ -51,6 +64,8 @@ class MowingBehavior : public Behavior {
   static MowingBehavior INSTANCE;
 
   std::string state_name() override;
+
+  std::string sub_state_name() override;
 
   Behavior* execute() override;
 

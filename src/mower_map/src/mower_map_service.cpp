@@ -96,6 +96,12 @@ struct DockingStation {
 struct MapData {
   std::vector<MapArea> areas;
   std::vector<DockingStation> docking_stations;
+  // Wall-clock time (epoch milliseconds) of the last save, set server-side in saveMapToFile() on
+  // every mutation. Doubles as a "map version": downstream consumers can record it alongside data
+  // (e.g. coverage) and treat that data as stale once it no longer matches. Compare it for equality,
+  // not ordering -- this is wall-clock time, so it is not monotonic (the Pi has no RTC and an NTP
+  // step can move it backwards). 0 means "never saved / unknown" (e.g. a pre-versioning map.json).
+  uint64_t last_updated = 0;
 
   std::vector<MapArea> getMowingAreas() {
     std::vector<MapArea> result;
@@ -162,7 +168,11 @@ void from_json(const json& j, DockingStation& data) {
   j.at("heading").get_to(data.heading);
 }
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MapData, areas, docking_stations)
+// WITH_DEFAULT so every field is optional on read (missing keys use the default-constructed value):
+// existing map.json files predate last_updated, and clients calling map.replace don't send it.
+// MapArea/DockingStation can't use this -- they reshape fields into a nested "properties" object --
+// but MapData is flat, so the macro expresses the intent exactly.
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(MapData, areas, docking_stations, last_updated)
 
 std::string MapData::toJsonString() {
   json json_data = *this;
@@ -540,6 +550,9 @@ void buildMap() {
  * We don't need to save the grid map, since we can easily build it again after loading.
  */
 void saveMapToFile() {
+  // Stamp the save time here, at the single choke point every mutation funnels through, so the
+  // value always reflects the real save and can't be spoofed or omitted by an RPC client.
+  map_data.last_updated = ros::Time::now().toNSec() / 1000000ULL;  // ns -> ms
   std::ofstream file(MAP_FILE);
   if (file.is_open()) {
     file << map_data.toJsonString();

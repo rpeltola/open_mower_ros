@@ -11,6 +11,7 @@ bool DiffDriveServiceInterface::OnConfigurationRequested(uint16_t service_id) {
   StartTransaction(true);
   SetRegisterWheelDistance(wheel_distance_);
   SetRegisterWheelTicksPerMeter(ticks_per_meter_);
+  SetRegisterShutdownESCMaxPitch(shutdown_esc_max_pitch_);
   CommitTransaction();
   return true;
 }

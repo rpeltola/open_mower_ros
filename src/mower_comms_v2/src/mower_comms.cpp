@@ -27,16 +27,28 @@
 #include <spdlog/spdlog.h>
 #include <std_msgs/String.h>
 
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
 #include "../../../services/service_ids.h"
 #include "BmsServiceInterface.h"
 #include "DiffDriveServiceInterface.h"
 #include "EmergencyServiceInterface.h"
+#include "FilesystemServiceInterface.h"
 #include "GpsServiceInterface.h"
 #include "HighLevelServiceInterface.h"
 #include "ImuServiceInterface.h"
 #include "InputServiceInterface.h"
 #include "MowerServiceInterface.h"
 #include "PowerServiceInterface.h"
+
+// RPC
+#include "xbot_mqtt/provider.h"
 
 ros::Publisher status_pub;
 ros::Publisher nmea_pub;
@@ -62,8 +74,171 @@ std::unique_ptr<BmsServiceInterface> bms_service = nullptr;
 std::unique_ptr<GpsServiceInterface> gps_service = nullptr;
 std::unique_ptr<InputServiceInterface> input_service = nullptr;
 std::unique_ptr<HighLevelServiceInterface> high_level_service = nullptr;
+std::unique_ptr<FilesystemServiceInterface> fs_service = nullptr;
 
 xbot::serviceif::Context ctx{};
+
+namespace {
+
+// Decodes a base64 string into raw bytes. Throws std::invalid_argument on malformed input.
+std::vector<uint8_t> base64Decode(const std::string& encoded) {
+  static const std::array<int8_t, 256> kDecodeTable = [] {
+    std::array<int8_t, 256> table{};
+    table.fill(-1);
+    const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < alphabet.size(); ++i) {
+      table[static_cast<uint8_t>(alphabet[i])] = static_cast<int8_t>(i);
+    }
+    return table;
+  }();
+
+  std::vector<uint8_t> result;
+  result.reserve(encoded.size() / 4 * 3 + 3);
+
+  uint32_t buffer = 0;
+  int bits_collected = 0;
+  for (char c : encoded) {
+    if (c == '=') break;
+    if (std::isspace(static_cast<unsigned char>(c))) continue;
+    int8_t value = kDecodeTable[static_cast<uint8_t>(c)];
+    if (value < 0) {
+      throw std::invalid_argument("Invalid base64 character");
+    }
+    buffer = (buffer << 6) | static_cast<uint32_t>(value);
+    bits_collected += 6;
+    if (bits_collected >= 8) {
+      bits_collected -= 8;
+      result.push_back(static_cast<uint8_t>((buffer >> bits_collected) & 0xFF));
+    }
+  }
+  return result;
+}
+
+// Returns the name of an FsResult value for use in RPC error messages.
+const char* fsResultName(FsResult result) {
+  switch (result) {
+    case FsResult::OK: return "OK";
+    case FsResult::ERR_IO: return "ERR_IO";
+    case FsResult::ERR_NOENT: return "ERR_NOENT";
+    case FsResult::ERR_INVAL: return "ERR_INVAL";
+    case FsResult::ERR_NOSPC: return "ERR_NOSPC";
+    case FsResult::ERR_SESSION: return "ERR_SESSION";
+    case FsResult::ERR_PATH: return "ERR_PATH";
+  }
+  return "UNKNOWN";
+}
+
+}  // namespace
+
+// clang-format off
+xbot_mqtt::RpcProvider fs_rpc_provider("mower_comms_v2", {{
+  RPC_METHOD("fs.list", {
+    std::string path;
+    if (params.is_object() && params.contains("path") && params.at("path").is_string()) {
+      path = params.at("path").get<std::string>();
+    }
+    ROS_INFO_STREAM("fs.list: path='" << path << "' (len " << path.size() << ")");
+    char buf[1024];
+    uint16_t result_length = sizeof(buf);
+    if (!fs_service->CallListFiles(path.c_str(), path.size(), buf, result_length)) {
+      ROS_ERROR_STREAM("fs.list: CallListFiles FAILED for path='" << path
+                       << "' (RPC timeout or firmware ERROR - see SendRpc log + firmware ULOG)");
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, "fs list failed");
+    }
+    ROS_INFO_STREAM("fs.list: firmware returned " << result_length << " bytes");
+    std::string listing(buf, result_length);
+    nlohmann::json files = nlohmann::json::array();
+    size_t pos = 0;
+    while (pos < listing.size()) {
+      size_t line_end = listing.find('\n', pos);
+      std::string line = listing.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+      size_t tab = line.find('\t');
+      if (tab != std::string::npos) {
+        nlohmann::json entry;
+        entry["name"] = line.substr(0, tab);
+        entry["size"] = std::stoull(line.substr(tab + 1));
+        files.push_back(entry);
+      }
+      if (line_end == std::string::npos) break;
+      pos = line_end + 1;
+    }
+    nlohmann::json response;
+    response["files"] = files;
+    return response;
+  }),
+  RPC_METHOD("fs.remove", {
+    if (!params.is_object() || !params.contains("path") || !params.at("path").is_string() ||
+        params.at("path").get<std::string>().empty()) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INVALID_PARAMS, "Missing path parameter");
+    }
+    std::string path = params.at("path").get<std::string>();
+    ROS_INFO_STREAM("fs.remove: path='" << path << "' (len " << path.size() << ")");
+    uint8_t result = 0;
+    if (!fs_service->CallRemoveFile(path.c_str(), path.size(), result)) {
+      ROS_ERROR_STREAM("fs.remove: CallRemoveFile FAILED for path='" << path
+                       << "' (RPC timeout or firmware ERROR - see SendRpc log + firmware ULOG)");
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, "fs remove failed");
+    }
+    ROS_INFO_STREAM("fs.remove: firmware FsResult=" << static_cast<int>(result) << " ("
+                    << fsResultName(static_cast<FsResult>(result)) << ")");
+    if (static_cast<FsResult>(result) != FsResult::OK) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, fsResultName(static_cast<FsResult>(result)));
+    }
+    nlohmann::json response;
+    response["ok"] = true;
+    return response;
+  }),
+  RPC_METHOD("fs.write", {
+    if (!params.is_object() || !params.contains("path") || !params.at("path").is_string() ||
+        params.at("path").get<std::string>().empty()) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INVALID_PARAMS, "Missing path parameter");
+    }
+    if (!params.contains("data") || !params.at("data").is_string()) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INVALID_PARAMS, "Missing data parameter");
+    }
+    std::string path = params.at("path").get<std::string>();
+    std::vector<uint8_t> data;
+    try {
+      data = base64Decode(params.at("data").get<std::string>());
+    } catch (const std::exception& e) {
+      throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INVALID_PARAMS,
+                                    std::string("Invalid base64 data: ") + e.what());
+    }
+
+    constexpr size_t kMaxChunkSize = 1024;
+    const size_t total = data.size();
+    ROS_INFO_STREAM("fs.write: path='" << path << "' (len " << path.size() << ") total=" << total << " bytes");
+    uint32_t offset = 0;
+    do {
+      const size_t chunk_size = std::min(kMaxChunkSize, total - offset);
+      uint8_t flags = 0;
+      if (offset == 0) flags |= FsChunkFlags::FIRST;
+      if (offset + chunk_size == total) flags |= FsChunkFlags::LAST;
+      uint8_t result = 0;
+      ROS_INFO_STREAM("fs.write: chunk offset=" << offset << " size=" << chunk_size
+                      << " flags=0x" << std::hex << static_cast<int>(flags) << std::dec);
+      if (!fs_service->CallAddFileChunk(path.c_str(), path.size(), offset, flags, data.data() + offset,
+                                        static_cast<uint32_t>(chunk_size), result)) {
+        ROS_ERROR_STREAM("fs.write: CallAddFileChunk FAILED at offset=" << offset
+                         << " (RPC timeout or firmware ERROR - see SendRpc log + firmware ULOG)");
+        throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, "fs write failed");
+      }
+      if (static_cast<FsResult>(result) != FsResult::OK) {
+        ROS_ERROR_STREAM("fs.write: firmware FsResult=" << static_cast<int>(result) << " ("
+                         << fsResultName(static_cast<FsResult>(result)) << ") at offset=" << offset);
+        throw xbot_mqtt::RpcException(xbot_mqtt::RpcError::ERROR_INTERNAL, fsResultName(static_cast<FsResult>(result)));
+      }
+      offset += static_cast<uint32_t>(chunk_size);
+    } while (offset < total);
+    ROS_INFO_STREAM("fs.write: completed path='" << path << "' " << total << " bytes");
+
+    nlohmann::json response;
+    response["ok"] = true;
+    response["bytes"] = total;
+    return response;
+  }),
+}});
+// clang-format on
 
 bool setEmergencyStop(mower_msgs::EmergencyStopSrvRequest& req, mower_msgs::EmergencyStopSrvResponse& res) {
   emergency_service->SetHighLevelEmergency(req.emergency);
@@ -130,6 +305,8 @@ int main(int argc, char** argv) {
   ros::NodeHandle n;
   ros::NodeHandle paramNh("/ll");
 
+  fs_rpc_provider.init();
+
   highLevelClient = n.serviceClient<mower_msgs::HighLevelControlSrv>("mower_service/high_level_control");
   action_pub = n.advertise<std_msgs::String>("xbot/action", 1);
 
@@ -161,6 +338,16 @@ int main(int argc, char** argv) {
   ROS_INFO_STREAM("Wheel ticks [1/m]: " << wheel_ticks_per_m);
   ROS_INFO_STREAM("Wheel distance [m]: " << wheel_distance_m);
 
+  // Optional: max pitch (deg) below which the drive ESCs are powered down when
+  // idle (0 = disabled). Defaults to 0 so robots that don't set it are unaffected.
+  int shutdown_esc_max_pitch = 0;
+  paramNh.param("services/diff_drive/shutdown_esc_max_pitch", shutdown_esc_max_pitch, 0);
+  if (shutdown_esc_max_pitch < 0 || shutdown_esc_max_pitch > 180) {
+    ROS_ERROR("services/diff_drive/shutdown_esc_max_pitch must be in [0, 180], got %d", shutdown_esc_max_pitch);
+    return 1;
+  }
+  ROS_INFO_STREAM("Shutdown ESC max pitch [deg]: " << shutdown_esc_max_pitch);
+
   int baud_rate = 0;
   paramNh.getParam("services/gps/baud_rate", baud_rate);
 
@@ -178,9 +365,9 @@ int main(int argc, char** argv) {
   ROS_INFO_STREAM("GPS protocol: " << protocol << ", baud rate: " << baud_rate
                                    << ", gps port index:" << gps_port_index);
 
-  diff_drive_service = std::make_unique<DiffDriveServiceInterface>(xbot::service_ids::DIFF_DRIVE, ctx, actual_twist_pub,
-                                                                   status_left_esc_pub, status_right_esc_pub,
-                                                                   wheel_ticks_per_m, wheel_distance_m);
+  diff_drive_service = std::make_unique<DiffDriveServiceInterface>(
+      xbot::service_ids::DIFF_DRIVE, ctx, actual_twist_pub, status_left_esc_pub, status_right_esc_pub,
+      wheel_ticks_per_m, wheel_distance_m, static_cast<uint8_t>(shutdown_esc_max_pitch));
   diff_drive_service->Start();
 
   // Mower service
@@ -280,6 +467,10 @@ int main(int argc, char** argv) {
   // HighLevel service
   high_level_service = std::make_unique<HighLevelServiceInterface>(xbot::service_ids::HIGH_LEVEL, ctx);
   high_level_service->Start();
+
+  // Filesystem service
+  fs_service = std::make_unique<FilesystemServiceInterface>(xbot::service_ids::FILESYSTEM, ctx);
+  fs_service->Start();
 
   // All subscriptions, timers and service servers are registered after all service interfaces are
   // fully constructed, so callbacks can never fire on null pointers.
